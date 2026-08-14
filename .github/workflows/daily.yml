@@ -25,6 +25,7 @@ env:
   # Actions → Variables 里新建 EM_PROXY，值形如 https://astock-ratio.xxx.workers.dev）。
   # 不配置也能跑，只是会退回腾讯近似口径。
   EM_PROXY: ${{ vars.EM_PROXY }}
+  PYTHONUNBUFFERED: "1"        # 让建库日志实时逐行输出，随时能看到进度
 
 jobs:
   build-and-deploy:
@@ -44,7 +45,7 @@ jobs:
 
       - name: Build denominator.json
         working-directory: builder
-        run: python build_denominator.py --out ../worker/public/denominator.json --limit ${{ github.event.inputs.limit || '0' }}
+        run: python build_denominator.py --out ../worker/public/denominator.json --workers 4 --limit ${{ github.event.inputs.limit || '0' }}
 
       - name: Commit data back to repo    # 试跑(limit>0)不提交，避免小样本数据污染仓库
         if: ${{ (github.event.inputs.limit || '0') == '0' }}

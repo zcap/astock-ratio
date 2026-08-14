@@ -40,7 +40,8 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
 EM_PUSH2 = ["push2.eastmoney.com", "82.push2.eastmoney.com", "21.push2.eastmoney.com"]
-EM_HIS = ["push2his.eastmoney.com", "23.push2his.eastmoney.com", "42.push2his.eastmoney.com"]
+EM_HIS = ["push2his.eastmoney.com", "23.push2his.eastmoney.com", "42.push2his.eastmoney.com",
+          "5.push2his.eastmoney.com", "64.push2his.eastmoney.com", "91.push2his.eastmoney.com"]
 EM_DATA = ["datacenter-web.eastmoney.com", "datacenter.eastmoney.com"]
 TX_QQ = ["proxy.finance.qq.com"]
 TX_IFZQ = ["web.ifzq.gtimg.cn"]
@@ -306,21 +307,39 @@ def fetch_ipo_prices() -> dict:
     return result
 
 
-# ---------------------------------------------------------------- 历史最低价（东财→代理→腾讯 + 熔断）
-class Breaker:
-    """某条通道连续失败达到阈值后熔断，本次运行不再尝试，避免每只股票都浪费重试时间。"""
+# ---------------------------------------------------------------- 历史最低价（东财→代理→腾讯 + 半开熔断）
+PROBE_EVERY = 25      # 熔断后每隔多少只股票探测一次该通道是否恢复
+BREAK_AFTER = 5       # 连续失败多少次触发熔断
+STALE_MAX = 10        # 东财口径的历史数据最多沿用多少个交易日
 
-    def __init__(self, name: str, threshold: int = 5):
-        self.name, self.fails, self.threshold, self.open = name, 0, threshold, False
+
+class Breaker:
+    """半开熔断：连续失败达到阈值后熔断，但每隔 PROBE_EVERY 只股票放行一次探测，
+    探测成功立即恢复通道——东财的封锁是间歇性的，漏风的时间窗要抓住。"""
+
+    def __init__(self, name: str, threshold: int = None, probe_every: int = None):
+        self.name = name
+        self.threshold = threshold or BREAK_AFTER
+        self.probe_every = probe_every or PROBE_EVERY
+        self.fails, self.open, self.calls = 0, False, 0
+
+    def should_try(self) -> bool:
+        self.calls += 1
+        if not self.open:
+            return True
+        return self.calls % self.probe_every == 0   # 半开探测
 
     def ok(self):
         self.fails = 0
+        if self.open:
+            self.open = False
+            print(f"      >> {self.name} 探测成功，通道恢复")
 
     def fail(self):
         self.fails += 1
         if not self.open and self.fails >= self.threshold:
             self.open = True
-            print(f"      !! {self.name} 连续失败，触发熔断：本次运行跳过该通道")
+            print(f"      !! {self.name} 连续失败，熔断（此后每 {self.probe_every} 只探测一次）")
 
 
 def _parse_em_kline(j):
@@ -346,6 +365,42 @@ def em_hist_low(code: str):
 
 def em_hist_low_proxy(code: str):
     return _parse_em_kline(proxy_json("/api/kline", {"secid": em_secid(code)}, tries=2))
+
+
+# ---- Baostock 通道（免费、等比复权口径、覆盖沪深、数据 T+1）----
+_BS = {"ok": None}   # None=未尝试, True=已登录, False=不可用
+
+
+def _bs_ready() -> bool:
+    if _BS["ok"] is None:
+        try:
+            import baostock as bs
+            lg = bs.login()
+            _BS["ok"] = getattr(lg, "error_code", "1") == "0"
+            if not _BS["ok"]:
+                print(f"      !! Baostock 登录失败：{getattr(lg, 'error_msg', '?')}")
+        except Exception as e:
+            _BS["ok"] = False
+            print(f"      !! Baostock 不可用：{e}")
+    return bool(_BS["ok"])
+
+
+def bs_hist_low(code: str):
+    """Baostock 前复权（涨跌幅等比算法，恒为正）历史最低。数据更新到上一交易日。"""
+    import baostock as bs
+    sym = ("sh." if code.startswith("6") else "sz.") + code
+    rs = bs.query_history_k_data_plus(sym, "low", start_date="1990-01-01",
+                                      frequency="d", adjustflag="2")
+    if getattr(rs, "error_code", "1") != "0":
+        raise RuntimeError(f"baostock error_code={rs.error_code}")
+    lows = []
+    while rs.next():
+        row = rs.get_row_data()
+        try:
+            lows.append(float(row[0]))
+        except (ValueError, TypeError, IndexError):
+            continue
+    return _min_positive(lows)
 
 
 def tx_hist_low(code: str):
@@ -379,7 +434,7 @@ def tx_hist_low(code: str):
 
 def fetch_hist_low(code: str, stats: dict, brks: dict):
     """返回 (low, src)。src: em/px/tx；减法复权失真返回 (None, 'neg')；全失败 (None, None)。"""
-    if not brks["em"].open:
+    if brks["em"].should_try():
         try:
             v = em_hist_low(code)
             brks["em"].ok()
@@ -388,7 +443,7 @@ def fetch_hist_low(code: str, stats: dict, brks: dict):
                 return v, "em"
         except Exception:
             brks["em"].fail()
-    if EM_PROXY and not brks["px"].open:
+    if EM_PROXY and brks["px"].should_try():
         try:
             v = em_hist_low_proxy(code)
             brks["px"].ok()
@@ -397,6 +452,15 @@ def fetch_hist_low(code: str, stats: dict, brks: dict):
                 return v, "px"
         except Exception:
             brks["px"].fail()
+    if not code.startswith(("43", "83", "87", "88", "92")) and _bs_ready() and brks["bs"].should_try():
+        try:
+            v = bs_hist_low(code)
+            brks["bs"].ok()
+            if v is not None:
+                stats["bs"] += 1
+                return v, "bs"
+        except Exception:
+            brks["bs"].fail()
     try:
         v, dirty = tx_hist_low(code)
         if dirty:
@@ -459,19 +523,47 @@ def main() -> None:
 
     ipo_map = fetch_ipo_prices()
     ckpt = Checkpoint(Path(__file__).resolve().parent / args.cache)
-    stats = {"em": 0, "px": 0, "tx": 0}
-    brks = {"em": Breaker("东财K线直连"), "px": Breaker("东财K线代理")}
+    stats = {"em": 0, "px": 0, "tx": 0, "bs": 0}
+    brks = {"em": Breaker("东财K线直连"), "px": Breaker("东财K线代理"), "bs": Breaker("Baostock")}
+
+    # 上一份数据里"东财口径"的记录（含之前顶替过的），东财够不着时可沿用（最多 STALE_MAX 天）
+    prev_em = {}
+    try:
+        prev = json.loads(Path(args.out).read_text(encoding="utf-8"))
+        if not prev.get("sample"):
+            for c, rec in (prev.get("items") or {}).items():
+                if rec.get("s") in (None, "bs"):   # 东财或 Baostock = 等比口径，可顶替
+                    prev_em[c] = rec
+    except Exception:
+        pass
+    if prev_em:
+        print(f"      上一份数据中有 {len(prev_em)} 条等比口径记录可作滞后顶替")
 
     def put(code, name, low, src):
         ipo = ipo_map.get(code)
         den = min(low, ipo) if ipo else low
         rec = {"n": name, "b": board_of(code), "l": low, "i": ipo, "d": round(den, 4)}
-        if src == "tx":
-            rec["s"] = "tx"   # 标记：该股为腾讯近似口径（减法复权、但全程为正）
+        if src in ("tx", "bs"):
+            rec["s"] = src   # tx=腾讯近似口径；bs=Baostock等比口径(T+1)
         items[code] = rec
 
+    def carry_prev(code, name):
+        """沿用上一份东财口径数据（滞后顶替）。滞后计数 st +1，超过上限则放弃。"""
+        rec = prev_em.get(code)
+        if not rec:
+            return False
+        st = int(rec.get("st", 0)) + 1
+        if st > STALE_MAX:
+            return False
+        new = dict(rec)
+        new["n"] = name or new.get("n", "")
+        new["st"] = st
+        items[code] = new
+        stale_used.append(code)
+        return True
+
     print(f"[3/3] 逐只拉取前复权历史最低价，共 {len(stocks)} 只 ...")
-    items, failed, neg = {}, [], []
+    items, failed, neg, stale_used = {}, [], [], []
     t0 = time.time()
 
     for i, (code, name) in enumerate(stocks):
@@ -479,16 +571,23 @@ def main() -> None:
             low, src = ckpt.done[code]
         else:
             low, src = fetch_hist_low(code, stats, brks)
-            if low is not None and src in ("em", "px", "tx"):
+            if low is not None and src in ("em", "px", "bs", "tx"):
                 ckpt.save(code, low, src)
             time.sleep(args.sleep)
 
-        if src == "neg":
-            neg.append(code)
-        elif low is None or low <= 0:
-            failed.append(code)
+        if src in ("em", "px") and low is not None and low > 0:
+            put(code, name, low, src)          # 东财新鲜数据，最优
+        elif src == "bs" and low is not None and low > 0:
+            put(code, name, low, src)          # Baostock 等比口径，次优
+        elif src == "tx" and low is not None and low > 0:
+            if not carry_prev(code, name):     # 有东财滞后数据则优先沿用（口径一致）
+                put(code, name, low, src)      # 否则用腾讯近似
+        elif src == "neg":
+            if not carry_prev(code, name):
+                neg.append(code)               # 减法复权失真且无历史可用 → 诚实剔除
         else:
-            put(code, name, low, src)
+            if not carry_prev(code, name):
+                failed.append(code)
 
         n = i + 1
         if n % 100 == 0 or n == len(stocks):
@@ -530,9 +629,12 @@ def main() -> None:
     out_path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 
     print(f"\n完成：{len(items)} 只写入 {out_path}")
-    print(f"股票名单来源：{list_src}；K 线来源：东财直连 {stats['em']}，东财代理 {stats['px']}，腾讯 {stats['tx']}")
+    print(f"股票名单来源：{list_src}；K 线来源：东财直连 {stats['em']}，东财代理 {stats['px']}，Baostock {stats['bs']}，腾讯 {stats['tx']}")
+    if stale_used:
+        st_max = max(int(items[c].get("st", 0)) for c in stale_used)
+        print(f"用上一份东财口径数据顶替 {len(stale_used)} 只（最长滞后 {st_max} 个交易日）")
     if neg:
-        print(f"减法复权失真剔除 {len(neg)} 只（高分红老股，需东财等比数据恢复后才能入榜）: "
+        print(f"减法复权失真剔除 {len(neg)} 只（高分红老股，且暂无东财等比数据可用）: "
               f"{neg[:15]}{' ...' if len(neg) > 15 else ''}")
     print(f"失败 {len(failed)} 只（停牌新股/退市/接口异常，前端会自动忽略）: "
           f"{failed[:20]}{' ...' if len(failed) > 20 else ''}")

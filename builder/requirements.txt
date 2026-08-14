@@ -1,2 +1,2 @@
-akshare>=1.18
+requests>=2.31
 pandas>=2.0

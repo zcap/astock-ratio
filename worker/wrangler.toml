@@ -1,0 +1,9 @@
+# Cloudflare Workers 配置：public/ 作为静态资产优先匹配，
+# 未命中的路径（如 /api/quotes）交给 src/worker.js 处理。
+# 部署：在本目录执行  npx wrangler deploy
+name = "astock-ratio"
+main = "src/worker.js"
+compatibility_date = "2025-05-01"
+
+[assets]
+directory = "./public"

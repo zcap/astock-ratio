@@ -8,7 +8,7 @@
 
 ```
 GitHub Actions（每交易日 15:40，免费）
-  └─ builder/build_denominator.py  用 akshare 抓全市场
+  └─ builder/build_denominator.py  抓全市场（东财/腾讯/新浪多源自动降级）
      前复权历史最低价 + 首发价格 + 板块 → denominator.json (约500KB)
         └─ 提交回仓库 + wrangler deploy 到 Cloudflare Workers
 
@@ -29,7 +29,7 @@ Cloudflare Workers（免费）
 
 ```
 ├── builder/
-│   ├── build_denominator.py   # 建库脚本（断点续跑、失败重试）
+│   ├── build_denominator.py   # 建库脚本（东财/腾讯/新浪多源自动降级、断点续跑）
 │   └── requirements.txt
 ├── worker/
 │   ├── wrangler.toml           # Cloudflare 配置
@@ -68,7 +68,7 @@ Cloudflare Workers（免费）
 
 ### 5. 试跑建库（5~10 分钟）
 
-**Actions → daily-denominator → Run workflow**，`limit` 填 **80** → 等绿灯。这一步验证 akshare 抓数据、生成 JSON、部署的整条链路。试跑的数据只部署不入库，不会污染仓库。
+**Actions → daily-denominator → Run workflow**，`limit` 填 **80** → 等绿灯。这一步验证抓数据、生成 JSON、部署的整条链路。试跑的数据只部署不入库，不会污染仓库。
 
 ### 6. 绑自定义域名（大陆直接访问的关键）
 
@@ -92,7 +92,7 @@ Cloudflare Workers（免费）
 cd builder
 pip install -r requirements.txt
 
-# 只跑前 80 只，约 2~3 分钟，验证 akshare 接口正常
+# 只跑前 80 只，约 2~3 分钟，验证数据接口正常
 python build_denominator.py --limit 80 --out ../worker/public/denominator.json
 ```
 
@@ -147,8 +147,8 @@ cd ../worker && npx wrangler deploy
 
 ## 数据口径与已知限制
 
-- 分母 = Min(上市以来前复权最低价, 首发价格)。除权除息会改变整条前复权序列，所以每天全量重算，而不是增量。
-- 首发价格来自东财新股数据库，较老的股票可能缺失，此时分母只取历史最低价（老股票经年分红后前复权低点通常远低于发行价，影响很小）。
+- 分母 = Min(上市以来前复权最低价, 首发价格)，其中前复权采用**等比复权**口径（东财算法，永远为正）。同花顺/通达信/腾讯默认的减法复权会让高分红老股（如贵州茅台）出现负价格，在本指标下没有意义；建库脚本以东财等比数据为准（直连不通时经自己的 Worker 中转），腾讯数据仅作近似兜底、且序列含非正值的股票会被剔除并记录在 `neg_excluded` 中。除权除息会改变整条前复权序列，所以每天全量重算，而不是增量。
+- 首发价格来自东财新股数据库，只覆盖 2010 年以后申购的新股，更老的股票缺失时分母只取历史最低价（老股票经年分红后前复权低点通常远低于发行价，影响很小）。
 - 停牌股（最新价为 "-"）和当天建库失败的股票不参与排序，页面统计栏会显示剔除数量。
 - 东财行情接口目前单页被限制在 100 条左右，页面用并发分页拉取（约 55 页，几秒完成），刷新间隔默认 60 秒，收盘后自动暂停。
 
@@ -156,9 +156,11 @@ cd ../worker && npx wrangler deploy
 
 **建库时被限流 / 大量失败？** 调大间隔：`python build_denominator.py --sleep 0.8`。断点缓存会保住已完成的部分。
 
-**GitHub Actions 的海外 IP 被东财拒绝？** 少见但可能。备选：在自己电脑/家里的机器上加个定时任务，跑完后 `cd worker && npx wrangler deploy` 即可，效果完全一样。
+**GitHub Actions 的海外 IP 被东财断连（RemoteDisconnected / Connection aborted）？** 东财对海外机房 IP 段封锁较狠，建库脚本为此做成了多数据源：股票名单按 东财 → 腾讯（沪深京全覆盖）→ 新浪 → 仓库里上一份名单 的顺序自动降级；K 线以东财为主、腾讯兜底，东财连续失败会触发熔断、整场直接改用腾讯；首发价格接口失败则本次缺失（分母退化为历史最低价，待东财恢复的某天自动补全）。运行日志末尾会打印本次实际用了哪些数据源。极端情况下所有源都失败，到 Actions 页 **Re-run all jobs** 换一台 runner 重试即可；全量模式下有效结果不足 4000 只脚本会主动报错退出，不会把残缺数据部署上线。
 
 **JSONP 直连失效？** 页面会自动退回 Worker 代理（走 Cloudflare 海外线路访问东财）。如果两者都不行，说明东财接口改了，届时可换腾讯行情接口（`qt.gtimg.cn`）作为数据源。
+
+**想要更"正规"的数据源？** 当前的免费拼盘（东财漏风捕捉 + Baostock 等比 + 腾讯近似 + 滞后顶替）对个人看板已经够用。想再升级：**Tushare Pro** 是最合适的下一步——注册拿 token（免费，部分接口有积分门槛），`daily` + `adj_factor` 两个接口就能精确复算任何复权口径，服务器对海外 IP 友好，可以作为建库脚本的又一条通道甚至主力。**TradingView 不适合当数据后端**：没有公开的历史数据 API，抓取图表数据违反其服务条款且极易失效，它适合人肉看图验证，不适合进管道。Wind/Choice/iFinD 是机构级付费方案，个人没必要。
 
 **改了页面想重新部署？** 网页流程：直接在 GitHub 上编辑并提交，deploy-only 自动触发。本地流程：先 `git pull`（Actions 每天会把最新 denominator.json 提交回仓库），再 `npx wrangler deploy`，否则会把本地旧数据部署上去。
 

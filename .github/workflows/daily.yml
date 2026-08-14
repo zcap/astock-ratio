@@ -20,6 +20,12 @@ on:
 permissions:
   contents: write            # 允许把生成的 denominator.json 提交回仓库
 
+env:
+  # 东财代理：你自己的 Worker 地址（在仓库 Settings → Secrets and variables →
+  # Actions → Variables 里新建 EM_PROXY，值形如 https://astock-ratio.xxx.workers.dev）。
+  # 不配置也能跑，只是会退回腾讯近似口径。
+  EM_PROXY: ${{ vars.EM_PROXY }}
+
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest

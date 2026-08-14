@@ -4,29 +4,25 @@
 每日盘后构建"分母"数据：
     分母 = Min(历史最低价[前复权], 首发价格)
 
-专为在 GitHub Actions（海外 IP）上运行设计，自带多重容错：
-  - 只依赖 requests，不依赖 akshare
-  - 东财接口带浏览器请求头 + 多镜像域名轮换 + 被断连后自动换新连接重试
-  - 个股历史 K 线：东财失败自动切换腾讯行情接口兜底
-  - 全市场列表：东财失败时退回仓库里上一份 denominator.json 的名单
+专为在 GitHub Actions（海外 IP，东财会封锁）上运行设计的多数据源版本：
+  - 全市场列表：东财 → 腾讯（覆盖沪深京）→ 新浪（沪深）→ 仓库里上一份数据的名单
+  - 历史 K 线：东财为主、腾讯兜底；东财连续失败会触发"熔断"，整场直接改用腾讯
+  - 首发价格：东财新股数据库；失败则本次缺失（分母退化为历史最低价，影响很小）
+  - 只依赖 requests；浏览器请求头 + 镜像轮换 + 断连自动换新连接重试
   - 断点续跑：同一天内中断后重新执行会跳过已完成的股票
   - 全量模式下有效结果太少会拒绝写出，防止把残缺数据部署上线
 
 用法：
-    # 快速试跑（只取前 80 只，几分钟）
-    python build_denominator.py --limit 80 --out ../worker/public/denominator.json
-
-    # 全量（约 5400 只，1~2 小时）
-    python build_denominator.py --out ../worker/public/denominator.json
-
-    # 调试个股
-    python build_denominator.py --codes 301332,600519 --out /tmp/test.json
+    python build_denominator.py --limit 80 --out ../worker/public/denominator.json   # 试跑
+    python build_denominator.py --out ../worker/public/denominator.json              # 全量
+    python build_denominator.py --codes 301332,600519 --out /tmp/test.json           # 调试
 """
 import argparse
 import datetime as dt
 import json
 import math
 import random
+import re
 import time
 from pathlib import Path
 
@@ -35,10 +31,12 @@ import requests
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
-EM_PUSH2 = ["push2.eastmoney.com", "82.push2.eastmoney.com", "21.push2.eastmoney.com", "45.push2.eastmoney.com"]
+EM_PUSH2 = ["push2.eastmoney.com", "82.push2.eastmoney.com", "21.push2.eastmoney.com"]
 EM_HIS = ["push2his.eastmoney.com", "23.push2his.eastmoney.com", "42.push2his.eastmoney.com"]
 EM_DATA = ["datacenter-web.eastmoney.com", "datacenter.eastmoney.com"]
-TX_HOSTS = ["web.ifzq.gtimg.cn"]
+TX_QQ = ["proxy.finance.qq.com"]
+TX_IFZQ = ["web.ifzq.gtimg.cn"]
+SINA = ["vip.stock.finance.sina.com.cn"]
 EM_REF = "https://quote.eastmoney.com/"
 FS_ALL = "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048"  # 沪深京全部 A 股
 
@@ -72,8 +70,7 @@ def _reset_session() -> None:
     _BOX["s"] = new_session()
 
 
-def get_json(hosts, path, params, referer, tries=4, timeout=15):
-    """带镜像轮换与重试的 GET → JSON。被远端断连时换全新连接再试。"""
+def _get(hosts, path, params, referer, tries, timeout, encoding=None):
     last = None
     for attempt in range(tries):
         host = hosts[attempt % len(hosts)]
@@ -81,13 +78,23 @@ def get_json(hosts, path, params, referer, tries=4, timeout=15):
             r = _session().get(f"https://{host}{path}", params=params,
                                timeout=timeout, headers={"Referer": referer})
             if r.status_code == 200:
-                return r.json()
+                if encoding:
+                    r.encoding = encoding
+                return r
             last = RuntimeError(f"HTTP {r.status_code} from {host}")
         except Exception as e:
             last = e
-            _reset_session()
-        time.sleep(0.6 * (attempt + 1) + random.random() * 0.6)
+            _reset_session()   # 被远端断连后换全新连接再试
+        time.sleep(0.5 * (attempt + 1) + random.random() * 0.5)
     raise last
+
+
+def get_json(hosts, path, params, referer, tries=3, timeout=15):
+    return _get(hosts, path, params, referer, tries, timeout).json()
+
+
+def get_text(hosts, path, params, referer, tries=3, timeout=15, encoding=None):
+    return _get(hosts, path, params, referer, tries, timeout, encoding).text
 
 
 # ---------------------------------------------------------------- 代码规则
@@ -118,9 +125,17 @@ def tx_symbol(code: str) -> str:
     return "bj" + code
 
 
-# ---------------------------------------------------------------- 全市场列表
-def fetch_stock_list():
-    print("[1/3] 拉取全市场股票列表（东财）...")
+def _dedup(pairs):
+    seen, uniq = set(), []
+    for c, n in pairs:
+        if c and c not in seen:
+            seen.add(c)
+            uniq.append((c, n))
+    return uniq
+
+
+# ---------------------------------------------------------------- 全市场列表（多源）
+def list_em():
     params = {"pn": 1, "pz": 100, "po": 1, "np": 1,
               "ut": "bd1d9ddb04089700cf9c27f6f7426281",
               "fltt": 2, "invt": 2, "fid": "f12", "fs": FS_ALL, "fields": "f12,f14"}
@@ -128,45 +143,91 @@ def fetch_stock_list():
     data = (first or {}).get("data") or {}
     diff, total = data.get("diff") or [], data.get("total", 0)
     if not diff:
-        raise RuntimeError("列表接口返回为空")
+        raise RuntimeError("东财列表返回为空")
     out = [(str(d["f12"]).zfill(6), d["f14"]) for d in diff]
-    pages = math.ceil(total / len(diff))
-    for pn in range(2, pages + 1):
+    for pn in range(2, math.ceil(total / len(diff)) + 1):
         params["pn"] = pn
         j = get_json(EM_PUSH2, "/api/qt/clist/get", params, EM_REF)
         out += [(str(d["f12"]).zfill(6), d["f14"]) for d in ((j or {}).get("data") or {}).get("diff") or []]
-        time.sleep(0.3 + random.random() * 0.5)
-    seen, uniq = set(), []
-    for c, n in out:
-        if c not in seen:
-            seen.add(c)
-            uniq.append((c, n))
-    print(f"      共 {len(uniq)} 只")
+        time.sleep(0.3 + random.random() * 0.4)
+    return _dedup(out)
+
+
+def list_tx():
+    """腾讯排行接口，覆盖沪深京全部 A 股。"""
+    params = {"_appver": "11.17.0", "board_code": "aStock",
+              "sort_type": "price", "direct": "down", "offset": 0, "count": 200}
+    out = []
+
+    def eat(d):
+        for rec in (d or {}).get("rank_list") or []:
+            code = re.sub(r"^(sh|sz|bj)", "", str(rec.get("code", "")))
+            if code.isdigit() and len(code) == 6:
+                out.append((code, str(rec.get("name", ""))))
+
+    j = get_json(TX_QQ, "/cgi/cgi-bin/rank/hs/getBoardRankList", params, "https://gu.qq.com/", timeout=30)
+    data = (j or {}).get("data") or {}
+    total = int(data.get("total") or 0)
+    eat(data)
+    for pg in range(1, math.ceil(total / 200)):
+        params["offset"] = pg * 200
+        j = get_json(TX_QQ, "/cgi/cgi-bin/rank/hs/getBoardRankList", params, "https://gu.qq.com/", timeout=30)
+        eat((j or {}).get("data") or {})
+        time.sleep(0.2 + random.random() * 0.3)
+    uniq = _dedup(out)
+    if len(uniq) < 1000:
+        raise RuntimeError(f"腾讯列表只返回 {len(uniq)} 只，疑似异常")
     return uniq
 
 
-def fetch_stock_list_with_fallback(prev_json_path: str):
-    try:
-        return fetch_stock_list()
-    except Exception as e:
-        print(f"      !! 东财列表接口失败：{e}")
+def list_sina():
+    """新浪列表（沪深 A，不含北交所）。返回的是键不带引号的 JS 字面量，需修补成 JSON。"""
+    out = []
+    for page in range(1, 120):
+        params = {"page": page, "num": 80, "sort": "symbol", "asc": 1,
+                  "node": "hs_a", "symbol": "", "_s_r_a": "page"}
+        text = get_text(SINA, "/quotes_service/api/json_v2.php/Market_Center.getHQNodeData",
+                        params, "https://vip.stock.finance.sina.com.cn/mkt/", encoding="gbk").strip()
+        if not text or text in ("null", "[]"):
+            break
+        arr = json.loads(re.sub(r'([{,])\s*([A-Za-z_]\w*)\s*:', r'\1"\2":', text))
+        if not arr:
+            break
+        out += [(str(rec.get("code", "")).zfill(6), str(rec.get("name", ""))) for rec in arr]
+        if len(arr) < 80:
+            break
+        time.sleep(0.3 + random.random() * 0.4)
+    uniq = _dedup(out)
+    if len(uniq) < 1000:
+        raise RuntimeError(f"新浪列表只返回 {len(uniq)} 只，疑似异常")
+    return uniq
+
+
+def fetch_stock_list(prev_json_path: str):
+    print("[1/3] 拉取全市场股票列表 ...")
+    for name, fn in (("东财", list_em), ("腾讯", list_tx), ("新浪", list_sina)):
+        try:
+            lst = fn()
+            print(f"      使用 {name} 列表：共 {len(lst)} 只")
+            return lst, name
+        except Exception as e:
+            print(f"      !! {name} 列表失败：{e}")
     p = Path(prev_json_path)
     if p.exists():
         try:
             prev = json.loads(p.read_text(encoding="utf-8"))
             if not prev.get("sample") and prev.get("items"):
                 lst = [(c, v["n"]) for c, v in prev["items"].items()]
-                print(f"      退回上一份数据的名单：{len(lst)} 只（当天新上市的会缺席，列表接口恢复后自动补上）")
-                return lst
+                print(f"      退回上一份数据的名单：{len(lst)} 只（当天新上市的会缺席）")
+                return lst, "历史名单"
         except Exception:
             pass
-    raise SystemExit("股票列表获取失败，且没有可用的历史名单。"
-                     "建议：到 Actions 页 Re-run 一次（换个 runner IP），或稍后再试。")
+    raise SystemExit("所有列表来源都失败了。建议：到 Actions 页 Re-run 一次（换 runner IP），或稍后再试。")
 
 
 # ---------------------------------------------------------------- 首发价格
 def fetch_ipo_prices() -> dict:
-    """东财新股数据库（覆盖 2010 年以后申购的新股；更老的股票缺失时分母只用历史最低价）。"""
+    """东财新股数据库（覆盖 2010 年以后申购的新股）。失败则本次缺失。"""
     print("[2/3] 拉取首发价格（东财新股数据库）...")
     params = {"sortColumns": "APPLY_DATE,SECURITY_CODE", "sortTypes": "-1,-1",
               "pageSize": 5000, "pageNumber": 1,
@@ -194,35 +255,48 @@ def fetch_ipo_prices() -> dict:
             params["pageNumber"] = pn
             eat(get_json(EM_DATA, "/api/data/v1/get", params, "https://data.eastmoney.com/"))
             time.sleep(0.2 + random.random() * 0.3)
+        print(f"      拿到 {len(result)} 条首发价格")
     except Exception as e:
         print(f"      !! 首发价格接口失败（{e}），本次按缺失处理：分母只用历史最低价")
-        return {}
-    print(f"      拿到 {len(result)} 条首发价格")
     return result
 
 
-# ---------------------------------------------------------------- 历史最低价
+# ---------------------------------------------------------------- 历史最低价（东财主力 + 腾讯兜底 + 熔断）
+class Breaker:
+    """东财连续失败达到阈值后熔断，本次运行剩余股票直接走腾讯，不再浪费重试时间。"""
+
+    def __init__(self, threshold: int = 6):
+        self.fails, self.threshold, self.open = 0, threshold, False
+
+    def ok(self):
+        self.fails = 0
+
+    def fail(self):
+        self.fails += 1
+        if not self.open and self.fails >= self.threshold:
+            self.open = True
+            print("      !! 东财 K 线接口连续失败，触发熔断：本次运行改用腾讯为主力数据源")
+
+
 def em_hist_low(code: str):
-    """东财 K 线（前复权），一次请求返回全部历史，只取日期+最低价两个字段。"""
     params = {"secid": em_secid(code), "klt": 101, "fqt": 1,
               "beg": "19900101", "end": "20500101", "lmt": 1000000,
               "ut": "7eea3edcaed734bea9cbfc24409ed989",
               "fields1": "f1,f2,f3", "fields2": "f51,f55"}
-    j = get_json(EM_HIS, "/api/qt/stock/kline/get", params, EM_REF, tries=3)
+    j = get_json(EM_HIS, "/api/qt/stock/kline/get", params, EM_REF, tries=2)
     klines = ((j or {}).get("data") or {}).get("klines")
     if not klines:
         return None
-    low = min(float(s.split(",")[1]) for s in klines if "," in s)
-    return round(low, 4)
+    return round(min(float(s.split(",")[1]) for s in klines if "," in s), 4)
 
 
 def tx_hist_low(code: str):
-    """腾讯行情兜底（前复权日K，单次最多 640 根，向前翻页拿全历史）。"""
+    """腾讯前复权日 K，单次最多 640 根，向前翻页拿全历史。"""
     sym = tx_symbol(code)
     lows, end = [], ""
-    for _ in range(40):  # 40 × 640 根，远超任何 A 股的历史长度
-        j = get_json(TX_HOSTS, "/appstock/app/fqkline/get",
-                     {"param": f"{sym},day,,{end},640,qfq"}, "https://gu.qq.com/", tries=3)
+    for _ in range(40):
+        j = get_json(TX_IFZQ, "/appstock/app/fqkline/get",
+                     {"param": f"{sym},day,,{end},640,qfq"}, "https://gu.qq.com/")
         node = ((j or {}).get("data") or {}).get(sym) or {}
         arr = node.get("qfqday") or node.get("day") or []
         if not arr:
@@ -232,18 +306,20 @@ def tx_hist_low(code: str):
             break
         first_day = dt.date.fromisoformat(arr[0][0])
         end = (first_day - dt.timedelta(days=1)).isoformat()
-        time.sleep(0.15)
+        time.sleep(0.12)
     return round(min(lows), 4) if lows else None
 
 
-def fetch_hist_low(code: str, stats: dict):
-    try:
-        v = em_hist_low(code)
-        if v is not None:
-            stats["em"] += 1
-            return v
-    except Exception:
-        pass
+def fetch_hist_low(code: str, stats: dict, brk: Breaker):
+    if not brk.open:
+        try:
+            v = em_hist_low(code)
+            brk.ok()
+            if v is not None:
+                stats["em"] += 1
+                return v
+        except Exception:
+            brk.fail()
     try:
         v = tx_hist_low(code)
         if v is not None:
@@ -285,7 +361,7 @@ def main() -> None:
     parser.add_argument("--out", default="../worker/public/denominator.json", help="输出 JSON 路径")
     parser.add_argument("--limit", type=int, default=0, help="只处理前 N 只（试跑用），0 = 全量")
     parser.add_argument("--codes", default="", help="只处理指定代码，逗号分隔（调试用）")
-    parser.add_argument("--sleep", type=float, default=0.35, help="每只股票之间的间隔秒数（防限流）")
+    parser.add_argument("--sleep", type=float, default=0.3, help="每只股票之间的间隔秒数（防限流）")
     parser.add_argument("--cache", default=".cache", help="断点缓存目录")
     parser.add_argument("--min-count", type=int, default=4000,
                         help="全量模式下有效结果低于该数则报错退出（防止部署残缺数据）")
@@ -293,7 +369,7 @@ def main() -> None:
 
     full_run = not args.codes and args.limit == 0
 
-    stocks = fetch_stock_list_with_fallback(args.out)
+    stocks, list_src = fetch_stock_list(args.out)
     if args.codes:
         wanted = {c.strip().zfill(6) for c in args.codes.split(",") if c.strip()}
         stocks = [(c, n) for c, n in stocks if c in wanted]
@@ -303,6 +379,7 @@ def main() -> None:
     ipo_map = fetch_ipo_prices()
     ckpt = Checkpoint(Path(__file__).resolve().parent / args.cache)
     stats = {"em": 0, "tx": 0}
+    brk = Breaker()
 
     print(f"[3/3] 逐只拉取前复权历史最低价，共 {len(stocks)} 只 ...")
     items, failed = {}, []
@@ -312,7 +389,7 @@ def main() -> None:
         if code in ckpt.done:
             low = ckpt.done[code]
         else:
-            low = fetch_hist_low(code, stats)
+            low = fetch_hist_low(code, stats, brk)
             if low is not None:
                 ckpt.save(code, low)
             time.sleep(args.sleep)
@@ -345,7 +422,8 @@ def main() -> None:
     out_path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 
     print(f"\n完成：{len(items)} 只写入 {out_path}")
-    print(f"数据源使用：东财 {stats['em']} 次，腾讯兜底 {stats['tx']} 次")
+    print(f"股票名单来源：{list_src}；K 线数据源：东财 {stats['em']} 次，腾讯 {stats['tx']} 次"
+          f"{'（东财已熔断）' if brk.open else ''}")
     print(f"失败 {len(failed)} 只（停牌新股/退市/接口异常，前端会自动忽略）: "
           f"{failed[:20]}{' ...' if len(failed) > 20 else ''}")
 

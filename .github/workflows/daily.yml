@@ -1,0 +1,58 @@
+# 每个交易日北京时间 15:40 自动重建分母数据并部署到 Cloudflare Workers。
+# 也可以在仓库的 Actions 页手动触发（Run workflow），并可填 limit 做小样本试跑。
+#
+# 需要先在仓库 Settings → Secrets and variables → Actions 里配置两个 Secret：
+#   CLOUDFLARE_API_TOKEN   （dash.cloudflare.com/profile/api-tokens → "Edit Cloudflare Workers" 模板）
+#   CLOUDFLARE_ACCOUNT_ID  （Cloudflare Dashboard 首页右侧，或浏览器地址栏 URL 里那串 ID）
+
+name: daily-denominator
+
+on:
+  schedule:
+    - cron: "40 7 * * 1-5"   # UTC 07:40 = 北京时间 15:40（法定节假日也会跑，无害）
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "只跑前 N 只（试跑用；0 或留空 = 全量）"
+        required: false
+        default: "0"
+
+permissions:
+  contents: write            # 允许把生成的 denominator.json 提交回仓库
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330     # 全量建库约 1~2 小时，留足余量
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: builder/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r builder/requirements.txt
+
+      - name: Build denominator.json
+        working-directory: builder
+        run: python build_denominator.py --out ../worker/public/denominator.json --limit ${{ github.event.inputs.limit || '0' }}
+
+      - name: Commit data back to repo    # 试跑(limit>0)不提交，避免小样本数据污染仓库
+        if: ${{ (github.event.inputs.limit || '0') == '0' }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase
+          git add worker/public/denominator.json
+          git diff --cached --quiet || git commit -m "data: denominator $(date -u +%F) [skip ci]"
+          git push
+
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: worker

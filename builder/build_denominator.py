@@ -37,10 +37,20 @@ import multiprocessing as mp
 import os
 import random
 import re
+import socket
 import time
 from pathlib import Path
 
 import requests
+
+# baostock 的 socket 不带超时，服务器抽风时会永久阻塞——全局兜底
+socket.setdefaulttimeout(25)
+
+# 所有打印强制 flush，进度实时可见（与 PYTHONUNBUFFERED 双保险）
+_print = print
+def print(*args, **kwargs):  # noqa: A001
+    kwargs.setdefault("flush", True)
+    _print(*args, **kwargs)
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
@@ -364,7 +374,8 @@ def em_hist_low_proxy(code: str):
 
 
 # ---------------------------------------------------------------- Baostock（周线等比，断线自愈）
-_BS = {"ok": None, "uses": 0}
+_BS = {"ok": None, "uses": 0, "denied": 0}
+BS_LOGIN_RETRY_EVERY = 200
 
 
 def _bs_quiet(fn, *args, **kwargs):
@@ -390,7 +401,13 @@ def _bs_ready() -> bool:
     if _BS["ok"] is None:
         _BS["ok"] = _bs_login()
         if not _BS["ok"]:
-            print("      !! Baostock 不可用（登录失败），该通道跳过")
+            print("      !! Baostock 暂不可用（登录失败/超时），稍后自动重试")
+    elif _BS["ok"] is False:
+        _BS["denied"] += 1
+        if _BS["denied"] % BS_LOGIN_RETRY_EVERY == 0:
+            _BS["ok"] = _bs_login()
+            if _BS["ok"]:
+                print("      >> Baostock 重新登录成功，通道恢复")
     return bool(_BS["ok"])
 
 
@@ -575,6 +592,7 @@ def process_stock(code, name, done, writer, ipo_map, prev_ok, stats, brks,
 
 def shard_worker(shard, codes, done, ipo_map, prev_ok, sleep, cache_dir, result_file):
     time.sleep(shard * 2.0)   # 错峰启动，避免多进程同时轰击
+    socket.setdefaulttimeout(25)
     _reset_session()
     writer = ShardWriter(Path(cache_dir), shard)
     stats = {"em": 0, "px": 0, "tx": 0, "bs": 0}

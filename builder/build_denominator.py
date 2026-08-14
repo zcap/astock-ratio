@@ -2,25 +2,33 @@
 # -*- coding: utf-8 -*-
 """
 每日盘后构建"分母"数据：
-    分母 = Min(历史最低价[前复权], 首发价格)
+    分母 = Min(历史最低价[前复权·等比], 首发价格)
 
-专为在 GitHub Actions（海外 IP，东财会封锁）上运行设计的多数据源版本：
-  - 全市场列表：东财 → 腾讯（覆盖沪深京）→ 新浪（沪深）→ 仓库里上一份数据的名单
-  - 历史 K 线：东财为主、腾讯兜底；东财连续失败会触发"熔断"，整场直接改用腾讯
-  - 首发价格：东财新股数据库；失败则本次缺失（分母退化为历史最低价，影响很小）
-  - 只依赖 requests；浏览器请求头 + 镜像轮换 + 断连自动换新连接重试
-  - 断点续跑：同一天内中断后重新执行会跳过已完成的股票
-  - 全量模式下有效结果太少会拒绝写出，防止把残缺数据部署上线
+口径说明（重要）：
+  前复权有两个流派——减法复权（同花顺/通达信/腾讯，高分红老股会出现负价格）
+  和等比复权（东方财富，永远为正）。"最新价÷历史最低"只有在等比口径下才有
+  "距底部多少倍"的含义，所以本脚本以东财等比数据为准；腾讯（减法口径）仅作
+  近似兜底，且序列中一旦出现非正值就把该股票剔除并单独计数，绝不产出错误分母。
+
+数据链路（专为 GitHub Actions 海外 IP 设计，东财封锁 GitHub 的 IP 段）：
+  股票名单：东财直连 → 东财·经 Worker 代理 → 腾讯（沪深京）→ 新浪 → 上一份名单
+  历史K线：东财直连 → 东财·经 Worker 代理 → 腾讯（近似，负值剔除）
+  首发价格：东财数据中心（实测未被封锁）；失败则本次缺失
+  其中"Worker 代理"是你自己部署在 Cloudflare 上的中转（环境变量 EM_PROXY，
+  形如 https://astock-ratio.xxx.workers.dev），GitHub → Cloudflare → 东财 借道而行。
+
+其他：断点续跑（同日中断重跑跳过已完成）、失败收尾二次重试、
+      全量模式下有效结果太少拒绝写出（防止部署残缺数据）。
 
 用法：
     python build_denominator.py --limit 80 --out ../worker/public/denominator.json   # 试跑
     python build_denominator.py --out ../worker/public/denominator.json              # 全量
-    python build_denominator.py --codes 301332,600519 --out /tmp/test.json           # 调试
 """
 import argparse
 import datetime as dt
 import json
 import math
+import os
 import random
 import re
 import time
@@ -39,6 +47,9 @@ TX_IFZQ = ["web.ifzq.gtimg.cn"]
 SINA = ["vip.stock.finance.sina.com.cn"]
 EM_REF = "https://quote.eastmoney.com/"
 FS_ALL = "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048"  # 沪深京全部 A 股
+
+# Cloudflare Worker 中转地址（可选），如 https://astock-ratio.xxx.workers.dev
+EM_PROXY = (os.environ.get("EM_PROXY") or "").strip().rstrip("/")
 
 
 # ---------------------------------------------------------------- 请求层
@@ -97,6 +108,14 @@ def get_text(hosts, path, params, referer, tries=3, timeout=15, encoding=None):
     return _get(hosts, path, params, referer, tries, timeout, encoding).text
 
 
+def proxy_json(path, params, tries=3, timeout=25):
+    """通过自己的 Cloudflare Worker 中转访问东财。"""
+    if not EM_PROXY:
+        raise RuntimeError("未配置 EM_PROXY")
+    host = EM_PROXY.replace("https://", "").replace("http://", "")
+    return get_json([host], path, params, EM_PROXY + "/", tries=tries, timeout=timeout)
+
+
 # ---------------------------------------------------------------- 代码规则
 def board_of(code: str) -> str:
     """根据代码前缀判定所属板块（不需要额外接口）。"""
@@ -134,22 +153,44 @@ def _dedup(pairs):
     return uniq
 
 
+def _min_positive(vals):
+    """取正数部分的最小值（0 是停牌占位等脏数据，跳过）。"""
+    pos = [v for v in vals if v > 0]
+    return round(min(pos), 4) if pos else None
+
+
 # ---------------------------------------------------------------- 全市场列表（多源）
+def _parse_clist(j):
+    return [(str(d["f12"]).zfill(6), d["f14"]) for d in ((j or {}).get("data") or {}).get("diff") or []]
+
+
 def list_em():
     params = {"pn": 1, "pz": 100, "po": 1, "np": 1,
               "ut": "bd1d9ddb04089700cf9c27f6f7426281",
               "fltt": 2, "invt": 2, "fid": "f12", "fs": FS_ALL, "fields": "f12,f14"}
     first = get_json(EM_PUSH2, "/api/qt/clist/get", params, EM_REF)
     data = (first or {}).get("data") or {}
-    diff, total = data.get("diff") or [], data.get("total", 0)
-    if not diff:
+    total, out = data.get("total", 0), _parse_clist(first)
+    if not out:
         raise RuntimeError("东财列表返回为空")
-    out = [(str(d["f12"]).zfill(6), d["f14"]) for d in diff]
-    for pn in range(2, math.ceil(total / len(diff)) + 1):
+    for pn in range(2, math.ceil(total / len(out) if len(out) else 1) + 1):
         params["pn"] = pn
-        j = get_json(EM_PUSH2, "/api/qt/clist/get", params, EM_REF)
-        out += [(str(d["f12"]).zfill(6), d["f14"]) for d in ((j or {}).get("data") or {}).get("diff") or []]
+        out += _parse_clist(get_json(EM_PUSH2, "/api/qt/clist/get", params, EM_REF))
         time.sleep(0.3 + random.random() * 0.4)
+    return _dedup(out)
+
+
+def list_em_proxy():
+    """东财列表，走自己的 Worker 中转（/api/quotes 返回的就是东财 clist 原始 JSON）。"""
+    first = proxy_json("/api/quotes", {"pn": 1, "pz": 100})
+    data = (first or {}).get("data") or {}
+    total, out = data.get("total", 0), _parse_clist(first)
+    if not out:
+        raise RuntimeError("代理列表返回为空")
+    per = len(out)
+    for pn in range(2, math.ceil(total / per) + 1):
+        out += _parse_clist(proxy_json("/api/quotes", {"pn": pn, "pz": per}))
+        time.sleep(0.15 + random.random() * 0.2)
     return _dedup(out)
 
 
@@ -181,7 +222,7 @@ def list_tx():
 
 
 def list_sina():
-    """新浪列表（沪深 A，不含北交所）。返回的是键不带引号的 JS 字面量，需修补成 JSON。"""
+    """新浪列表（沪深 A，不含北交所）。返回键不带引号的 JS 字面量，需修补成 JSON。"""
     out = []
     for page in range(1, 120):
         params = {"page": page, "num": 80, "sort": "symbol", "asc": 1,
@@ -205,7 +246,11 @@ def list_sina():
 
 def fetch_stock_list(prev_json_path: str):
     print("[1/3] 拉取全市场股票列表 ...")
-    for name, fn in (("东财", list_em), ("腾讯", list_tx), ("新浪", list_sina)):
+    sources = [("东财", list_em)]
+    if EM_PROXY:
+        sources.append(("东财(代理)", list_em_proxy))
+    sources += [("腾讯", list_tx), ("新浪", list_sina)]
+    for name, fn in sources:
         try:
             lst = fn()
             print(f"      使用 {name} 列表：共 {len(lst)} 只")
@@ -261,12 +306,12 @@ def fetch_ipo_prices() -> dict:
     return result
 
 
-# ---------------------------------------------------------------- 历史最低价（东财主力 + 腾讯兜底 + 熔断）
+# ---------------------------------------------------------------- 历史最低价（东财→代理→腾讯 + 熔断）
 class Breaker:
-    """东财连续失败达到阈值后熔断，本次运行剩余股票直接走腾讯，不再浪费重试时间。"""
+    """某条通道连续失败达到阈值后熔断，本次运行不再尝试，避免每只股票都浪费重试时间。"""
 
-    def __init__(self, threshold: int = 6):
-        self.fails, self.threshold, self.open = 0, threshold, False
+    def __init__(self, name: str, threshold: int = 5):
+        self.name, self.fails, self.threshold, self.open = name, 0, threshold, False
 
     def ok(self):
         self.fails = 0
@@ -275,7 +320,20 @@ class Breaker:
         self.fails += 1
         if not self.open and self.fails >= self.threshold:
             self.open = True
-            print("      !! 东财 K 线接口连续失败，触发熔断：本次运行改用腾讯为主力数据源")
+            print(f"      !! {self.name} 连续失败，触发熔断：本次运行跳过该通道")
+
+
+def _parse_em_kline(j):
+    klines = ((j or {}).get("data") or {}).get("klines")
+    if not klines:
+        return None
+    lows = []
+    for s in klines:
+        try:
+            lows.append(float(s.split(",")[1]))
+        except (ValueError, IndexError):
+            continue
+    return _min_positive(lows)
 
 
 def em_hist_low(code: str):
@@ -283,17 +341,18 @@ def em_hist_low(code: str):
               "beg": "19900101", "end": "20500101", "lmt": 1000000,
               "ut": "7eea3edcaed734bea9cbfc24409ed989",
               "fields1": "f1,f2,f3", "fields2": "f51,f55"}
-    j = get_json(EM_HIS, "/api/qt/stock/kline/get", params, EM_REF, tries=2)
-    klines = ((j or {}).get("data") or {}).get("klines")
-    if not klines:
-        return None
-    return round(min(float(s.split(",")[1]) for s in klines if "," in s), 4)
+    return _parse_em_kline(get_json(EM_HIS, "/api/qt/stock/kline/get", params, EM_REF, tries=2))
+
+
+def em_hist_low_proxy(code: str):
+    return _parse_em_kline(proxy_json("/api/kline", {"secid": em_secid(code)}, tries=2))
 
 
 def tx_hist_low(code: str):
-    """腾讯前复权日 K，单次最多 640 根，向前翻页拿全历史。"""
+    """腾讯前复权（减法口径）。返回 (正值最低, 是否含非正值脏数据)。
+    含非正值说明该股减法复权已失真（高分红老股），其最低价不可用。"""
     sym = tx_symbol(code)
-    lows, end = [], ""
+    lows, dirty, end = [], False, ""
     for _ in range(40):
         j = get_json(TX_IFZQ, "/appstock/app/fqkline/get",
                      {"param": f"{sym},day,,{end},640,qfq"}, "https://gu.qq.com/")
@@ -301,33 +360,53 @@ def tx_hist_low(code: str):
         arr = node.get("qfqday") or node.get("day") or []
         if not arr:
             break
-        lows += [float(bar[4]) for bar in arr if len(bar) > 4]
+        for bar in arr:
+            try:
+                v = float(bar[4])
+            except (ValueError, TypeError, IndexError):
+                continue
+            if v <= 0:
+                dirty = True
+            else:
+                lows.append(v)
         if len(arr) < 640:
             break
         first_day = dt.date.fromisoformat(arr[0][0])
         end = (first_day - dt.timedelta(days=1)).isoformat()
         time.sleep(0.12)
-    return round(min(lows), 4) if lows else None
+    return (_min_positive(lows), dirty)
 
 
-def fetch_hist_low(code: str, stats: dict, brk: Breaker):
-    if not brk.open:
+def fetch_hist_low(code: str, stats: dict, brks: dict):
+    """返回 (low, src)。src: em/px/tx；减法复权失真返回 (None, 'neg')；全失败 (None, None)。"""
+    if not brks["em"].open:
         try:
             v = em_hist_low(code)
-            brk.ok()
+            brks["em"].ok()
             if v is not None:
                 stats["em"] += 1
-                return v
+                return v, "em"
         except Exception:
-            brk.fail()
+            brks["em"].fail()
+    if EM_PROXY and not brks["px"].open:
+        try:
+            v = em_hist_low_proxy(code)
+            brks["px"].ok()
+            if v is not None:
+                stats["px"] += 1
+                return v, "px"
+        except Exception:
+            brks["px"].fail()
     try:
-        v = tx_hist_low(code)
+        v, dirty = tx_hist_low(code)
+        if dirty:
+            return None, "neg"
         if v is not None:
             stats["tx"] += 1
-            return v
+            return v, "tx"
     except Exception:
         pass
-    return None
+    return None, None
 
 
 # ---------------------------------------------------------------- 断点缓存
@@ -343,15 +422,15 @@ class Checkpoint:
             for line in self.path.read_text(encoding="utf-8").splitlines():
                 try:
                     rec = json.loads(line)
-                    self.done[rec["c"]] = rec["l"]
+                    self.done[rec["c"]] = (rec["l"], rec.get("s"))
                 except (json.JSONDecodeError, KeyError):
                     continue
             print(f"      发现断点缓存 {self.path.name}，已完成 {len(self.done)} 只")
         self._fh = self.path.open("a", encoding="utf-8")
 
-    def save(self, code: str, low: float) -> None:
-        self.done[code] = low
-        self._fh.write(json.dumps({"c": code, "l": low}, ensure_ascii=False) + "\n")
+    def save(self, code: str, low: float, src: str) -> None:
+        self.done[code] = (low, src)
+        self._fh.write(json.dumps({"c": code, "l": low, "s": src}, ensure_ascii=False) + "\n")
         self._fh.flush()
 
 
@@ -368,6 +447,8 @@ def main() -> None:
     args = parser.parse_args()
 
     full_run = not args.codes and args.limit == 0
+    if EM_PROXY:
+        print(f"东财代理已配置：{EM_PROXY}")
 
     stocks, list_src = fetch_stock_list(args.out)
     if args.codes:
@@ -378,34 +459,60 @@ def main() -> None:
 
     ipo_map = fetch_ipo_prices()
     ckpt = Checkpoint(Path(__file__).resolve().parent / args.cache)
-    stats = {"em": 0, "tx": 0}
-    brk = Breaker()
+    stats = {"em": 0, "px": 0, "tx": 0}
+    brks = {"em": Breaker("东财K线直连"), "px": Breaker("东财K线代理")}
+
+    def put(code, name, low, src):
+        ipo = ipo_map.get(code)
+        den = min(low, ipo) if ipo else low
+        rec = {"n": name, "b": board_of(code), "l": low, "i": ipo, "d": round(den, 4)}
+        if src == "tx":
+            rec["s"] = "tx"   # 标记：该股为腾讯近似口径（减法复权、但全程为正）
+        items[code] = rec
 
     print(f"[3/3] 逐只拉取前复权历史最低价，共 {len(stocks)} 只 ...")
-    items, failed = {}, []
+    items, failed, neg = {}, [], []
     t0 = time.time()
 
     for i, (code, name) in enumerate(stocks):
         if code in ckpt.done:
-            low = ckpt.done[code]
+            low, src = ckpt.done[code]
         else:
-            low = fetch_hist_low(code, stats, brk)
-            if low is not None:
-                ckpt.save(code, low)
+            low, src = fetch_hist_low(code, stats, brks)
+            if low is not None and src in ("em", "px", "tx"):
+                ckpt.save(code, low, src)
             time.sleep(args.sleep)
 
-        if low is None or low <= 0:
+        if src == "neg":
+            neg.append(code)
+        elif low is None or low <= 0:
             failed.append(code)
         else:
-            ipo = ipo_map.get(code)
-            den = min(low, ipo) if ipo else low
-            items[code] = {"n": name, "b": board_of(code), "l": low, "i": ipo, "d": round(den, 4)}
+            put(code, name, low, src)
 
         n = i + 1
         if n % 100 == 0 or n == len(stocks):
             speed = n / max(time.time() - t0, 1)
             eta = (len(stocks) - n) / max(speed, 0.01)
-            print(f"      {n}/{len(stocks)}  成功 {len(items)}  失败 {len(failed)}  预计剩余 {eta/60:.0f} 分钟")
+            print(f"      {n}/{len(stocks)}  成功 {len(items)}  失败 {len(failed)}  "
+                  f"复权失真剔除 {len(neg)}  预计剩余 {eta/60:.0f} 分钟")
+
+    # 对失败的做一轮收尾二次重试（网络抖动的第二次机会；复权失真的不重试）
+    if failed:
+        print(f"      对失败的 {len(failed)} 只做二次重试 ...")
+        name_map = dict(stocks)
+        still = []
+        for code in failed:
+            low, src = fetch_hist_low(code, stats, brks)
+            time.sleep(args.sleep)
+            if src == "neg":
+                neg.append(code)
+            elif low is not None and low > 0:
+                ckpt.save(code, low, src)
+                put(code, name_map.get(code, ""), low, src)
+            else:
+                still.append(code)
+        failed = still
 
     if full_run and len(items) < args.min_count:
         raise SystemExit(f"有效结果只有 {len(items)} 只（< {args.min_count}），疑似接口大面积失败，"
@@ -415,6 +522,7 @@ def main() -> None:
         "build_date": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
         "count": len(items),
         "failed": failed,
+        "neg_excluded": neg,
         "items": items,
     }
     out_path = Path(args.out).resolve()
@@ -422,8 +530,10 @@ def main() -> None:
     out_path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 
     print(f"\n完成：{len(items)} 只写入 {out_path}")
-    print(f"股票名单来源：{list_src}；K 线数据源：东财 {stats['em']} 次，腾讯 {stats['tx']} 次"
-          f"{'（东财已熔断）' if brk.open else ''}")
+    print(f"股票名单来源：{list_src}；K 线来源：东财直连 {stats['em']}，东财代理 {stats['px']}，腾讯 {stats['tx']}")
+    if neg:
+        print(f"减法复权失真剔除 {len(neg)} 只（高分红老股，需东财等比数据恢复后才能入榜）: "
+              f"{neg[:15]}{' ...' if len(neg) > 15 else ''}")
     print(f"失败 {len(failed)} 只（停牌新股/退市/接口异常，前端会自动忽略）: "
           f"{failed[:20]}{' ...' if len(failed) > 20 else ''}")
 

@@ -1,0 +1,24 @@
+# 快速重新部署（不重建数据，几十秒完成）：
+#   - 第一次上线就手动跑这个：Actions → deploy-only → Run workflow
+#   - 之后凡是改了 worker/ 目录（比如网页上编辑 index.html），push 会自动触发
+# 部署内容用的是仓库里当前的 denominator.json（每天全量建库后会自动提交回来，最多滞后一天）。
+
+name: deploy-only
+
+on:
+  push:
+    branches: [main]
+    paths: ["worker/**"]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: worker

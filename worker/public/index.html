@@ -208,44 +208,114 @@ async function pool(thunks, limit = 6) {
   return failed;
 }
 
-/* ================= 行情拉取（全市场快照，自适应分页） ================= */
+/* ================= 行情拉取（东财直连 → 腾讯批量 → Worker代理 三级链路） ================= */
 const FS = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"; // 沪深京A股
 const QBASE = "https://push2.eastmoney.com/api/qt/clist/get?po=0&np=1&fltt=2&invt=2&fid=f12"
   + "&ut=bd1d9ddb04089700cf9c27f6f7426281&fs=" + FS + "&fields=f2,f3,f12,f14";
 
-// 优先 JSONP 直连东财（走你自己的国内网络，快且稳）；
-// 直连失败时退回同域 Worker 代理 /api/quotes（Cloudflare 海外节点访问东财，仅兜底）。
-async function getPage(pn, pz) {
-  try { return await jsonp(QBASE + "&pn=" + pn + "&pz=" + pz); }
-  catch (e) {
-    const r = await fetch(`/api/quotes?pn=${pn}&pz=${pz}`);
-    if (!r.ok) throw new Error("proxy HTTP " + r.status);
-    return r.json();
-  }
-}
-
-async function fetchQuotes(onProgress) {
-  const quotes = new Map();
-  const eat = arr => (arr || []).forEach(d => {
+function eatEM(quotes, arr) {
+  (arr || []).forEach(d => {
     if (d.f2 !== "-" && d.f2 != null) quotes.set(String(d.f12), { p: +d.f2, chg: d.f3 === "-" ? null : +d.f3, n: d.f14 });
   });
-  const first = await getPage(1, 1000);
-  if (!first || !first.data || !first.data.diff) throw new Error("行情接口返回异常");
-  eat(first.data.diff);
+}
+
+async function fetchQuotesEM(onProgress) {
+  const quotes = new Map();
+  const first = await jsonp(QBASE + "&pn=1&pz=1000");
+  if (!first || !first.data || !first.data.diff) throw new Error("东财返回异常");
+  eatEM(quotes, first.data.diff);
   const total = first.data.total, pageSize = first.data.diff.length;
   const pages = Math.ceil(total / pageSize);
   let done = 1;
-  onProgress(done, pages);
+  onProgress(done, pages, "东财");
   const thunks = [];
   for (let pn = 2; pn <= pages; pn++) {
     thunks.push(async () => {
-      const r = await getPage(pn, pageSize);
-      eat(r && r.data && r.data.diff);
-      onProgress(++done, pages);
+      const r = await jsonp(QBASE + "&pn=" + pn + "&pz=" + pageSize);
+      eatEM(quotes, r && r.data && r.data.diff);
+      onProgress(++done, pages, "东财");
     });
   }
-  const failedPages = await pool(thunks, 6);
-  return { quotes, failedPages, pages };
+  await pool(thunks, 6);
+  return quotes;
+}
+
+// 腾讯批量行情：qt.gtimg.cn 支持 <script> 直挂（返回 v_shXXXXXX 全局变量，GBK 编码）
+function txSym(c) { return (c[0] === "6" ? "sh" : (c[0] === "0" || c[0] === "3") ? "sz" : "bj") + c; }
+
+async function fetchQuotesTX(codes, onProgress) {
+  const quotes = new Map();
+  const chunks = [];
+  for (let i = 0; i < codes.length; i += 80) chunks.push(codes.slice(i, i + 80));
+  let done = 0;
+  const loadChunk = chunk => new Promise(resolve => {
+    const syms = chunk.map(txSym);
+    const s = document.createElement("script");
+    s.charset = "GBK";
+    const timer = setTimeout(() => { s.remove(); onProgress(++done, chunks.length, "腾讯"); resolve(); }, 12000);
+    const finish = () => {
+      clearTimeout(timer);
+      for (const sym of syms) {
+        const v = window["v_" + sym];
+        if (typeof v === "string") {
+          const f = v.split("~");
+          const price = +f[3];
+          if (price > 0) quotes.set(f[2], { p: price, chg: isNaN(+f[32]) ? null : +f[32], n: f[1] });
+          try { delete window["v_" + sym]; } catch (e) {}
+        }
+      }
+      s.remove(); onProgress(++done, chunks.length, "腾讯"); resolve();
+    };
+    s.onload = finish;
+    s.onerror = () => { clearTimeout(timer); s.remove(); onProgress(++done, chunks.length, "腾讯"); resolve(); };
+    s.src = "https://qt.gtimg.cn/q=" + syms.join(",") + "&_t=" + Date.now();
+    document.head.appendChild(s);
+  });
+  await pool(chunks.map(c => () => loadChunk(c)), 6);
+  return quotes;
+}
+
+async function fetchQuotesProxy(onProgress) {
+  const quotes = new Map();
+  const g = async (pn, pz) => {
+    const r = await fetch(`/api/quotes?pn=${pn}&pz=${pz}`);
+    if (!r.ok) throw new Error("proxy HTTP " + r.status);
+    return r.json();
+  };
+  const first = await g(1, 100);
+  if (!first || !first.data || !first.data.diff) throw new Error("代理返回异常");
+  eatEM(quotes, first.data.diff);
+  const total = first.data.total, per = first.data.diff.length, pages = Math.ceil(total / per);
+  let done = 1;
+  onProgress(done, pages, "代理");
+  const thunks = [];
+  for (let pn = 2; pn <= pages; pn++) {
+    thunks.push(async () => { eatEM(quotes, (await g(pn, per)).data.diff); onProgress(++done, pages, "代理"); });
+  }
+  await pool(thunks, 6);
+  return quotes;
+}
+
+async function fetchQuotes(onProgress) {
+  let quotes = new Map(), src = "";
+  try { quotes = await fetchQuotesEM(onProgress); src = "东财"; } catch (e) {}
+  if (quotes.size < 500) {
+    const codes = Object.keys((S.denom && S.denom.items) || {});
+    if (codes.length) {
+      try {
+        const q2 = await fetchQuotesTX(codes, onProgress);
+        if (q2.size > quotes.size) { quotes = q2; src = "腾讯"; }
+      } catch (e) {}
+    }
+  }
+  if (quotes.size < 500) {
+    try {
+      const q3 = await fetchQuotesProxy(onProgress);
+      if (q3.size > quotes.size) { quotes = q3; src = "东财代理"; }
+    } catch (e) {}
+  }
+  if (!quotes.size) throw new Error("东财直连 / 腾讯 / 代理三条行情通道均失败");
+  return { quotes, src };
 }
 
 /* ================= 合并计算 ================= */
@@ -340,23 +410,27 @@ async function refresh() {
   S.busy = true;
   const banner = $("banner");
   try {
-    const { quotes, failedPages, pages } = await fetchQuotes((d, t) => {
-      if ($("tbl").style.display === "none") $("loading").textContent = `拉取全市场行情 ${d}/${t} 页 ...`;
+    const { quotes, src } = await fetchQuotes((d, t, name) => {
+      if ($("tbl").style.display === "none") $("loading").textContent = `拉取全市场行情（${name}） ${d}/${t} ...`;
     });
+    S.retry = 0;
     mergeRows(quotes);
     render();
-    $("quoteTime").textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+    $("quoteTime").textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false }) + " · " + src;
     $("quoteTime").classList.remove("flash"); void $("quoteTime").offsetWidth; $("quoteTime").classList.add("flash");
     if (S.denom.sample) {
       banner.className = "banner warn";
       banner.textContent = "当前展示的是仓库自带的示例分母数据 — 请先运行 builder/build_denominator.py 生成真实数据并重新部署。";
-    } else if (failedPages > pages * 0.2) {
-      banner.className = "banner warn";
-      banner.textContent = `行情分页有 ${failedPages}/${pages} 页拉取失败，榜单可能不完整（可能被限流，稍后会自动重试）。`;
     } else { banner.className = "banner"; banner.textContent = ""; }
   } catch (e) {
+    S.retry = (S.retry || 0) + 1;
     banner.className = "banner err";
-    banner.textContent = "行情拉取失败：" + e.message + "（东财接口可能暂时不可用或网络受限，稍后自动重试）";
+    if (S.retry <= 4) {
+      banner.textContent = `行情拉取失败：${e.message}（15 秒后自动重试 ${S.retry}/4）`;
+      setTimeout(refresh, 15000);
+    } else {
+      banner.textContent = `行情拉取失败：${e.message}（自动重试已达上限，请点击"立即刷新"）`;
+    }
   } finally {
     S.busy = false;
     armTimer();

@@ -69,7 +69,7 @@ EM_PROXY = (os.environ.get("EM_PROXY") or "").strip().rstrip("/")
 
 PROBE_EVERY = 25      # 熔断后每隔多少只股票探测一次
 BREAK_AFTER = 5       # 连续失败多少次触发熔断
-STALE_MAX = 10        # 等比口径历史数据最多沿用多少个交易日
+STALE_MAX = 15        # 等比口径历史数据最多沿用多少个交易日
 BS_RELOGIN_EVERY = 250
 
 
@@ -411,12 +411,15 @@ def _bs_ready() -> bool:
     return bool(_BS["ok"])
 
 
-def _bs_query_low(code: str):
+_BS_MODE = {"f": "w", "wfail": 0}   # 周线口径持续失败会自动切回日线
+
+
+def _bs_query_low(code: str, freq: str = None):
     import baostock as bs
     sym = ("sh." if code.startswith("6") else "sz.") + code
     # 周K取 min 与日K取 min 等价（每根周线的 low 就是当周最低），数据量降 5 倍
     rs = _bs_quiet(bs.query_history_k_data_plus, sym, "low",
-                   start_date="1990-01-01", frequency="w", adjustflag="2")
+                   start_date="1990-01-01", frequency=freq or _BS_MODE["f"], adjustflag="2")
     if getattr(rs, "error_code", "1") != "0":
         raise RuntimeError(f"baostock error_code={rs.error_code}")
     lows = []
@@ -437,11 +440,24 @@ def bs_hist_low(code: str):
     if _BS["uses"] >= BS_RELOGIN_EVERY:
         _bs_login()
     try:
-        return _bs_query_low(code)
+        v = _bs_query_low(code)
+        _BS_MODE["wfail"] = 0
+        return v
     except Exception:
         if not _bs_login():
             raise
-        return _bs_query_low(code)
+        try:
+            v = _bs_query_low(code)
+            _BS_MODE["wfail"] = 0
+            return v
+        except Exception:
+            if _BS_MODE["f"] == "w":
+                _BS_MODE["wfail"] += 1
+                if _BS_MODE["wfail"] >= 3:
+                    _BS_MODE["f"] = "d"
+                    print("      !! Baostock 周线口径持续失败，自动切换回日线")
+                return _bs_query_low(code, "d")   # 立刻用日线再试一次
+            raise
 
 
 # ---------------------------------------------------------------- 腾讯（周线，减法口径近似）
@@ -493,15 +509,6 @@ def fetch_hist_low(code: str, stats: dict, brks: dict):
                 return v, "px"
         except Exception:
             brks["px"].fail()
-    if not code.startswith(("43", "83", "87", "88", "92")) and _bs_ready() and brks["bs"].should_try():
-        try:
-            v = bs_hist_low(code)
-            brks["bs"].ok()
-            if v is not None:
-                stats["bs"] += 1
-                return v, "bs"
-        except Exception:
-            brks["bs"].fail()
     try:
         v, dirty = tx_hist_low(code)
         if dirty:
@@ -512,6 +519,61 @@ def fetch_hist_low(code: str, stats: dict, brks: dict):
     except Exception:
         pass
     return None, None
+
+
+# ---------------------------------------------------------------- Baostock 等比补录（单连接串行）
+def bs_rescue(items, neg, failed, stocks_map, ipo_map, stats, budget, sleep=0.15):
+    """并行阶段结束后，由主进程用单条 Baostock 连接串行补等比数据（多进程多连接
+    会被服务端互踢会话，这是此前 Baostock 全灭的根因）。
+    优先级：被剔除/失败的（否则缺席）> 腾讯近似的（升级口径）> 最旧的滞后记录（轮换刷新）。
+    每天预算 budget 只，全市场会在几天内收敛为等比口径并持续轮换保鲜。"""
+    queue, seen = [], set()
+
+    def add(c):
+        if c not in seen and not c.startswith(("43", "83", "87", "88", "92")):
+            seen.add(c)
+            queue.append(c)
+
+    for c in neg + failed:
+        add(c)
+    for c, rec in items.items():
+        if rec.get("s") == "tx":
+            add(c)
+    for c in sorted((c for c, r in items.items() if r.get("st")),
+                    key=lambda c: -int(items[c].get("st", 0))):
+        add(c)
+    queue = queue[:budget]
+    if not queue:
+        return neg, failed
+    if not _bs_ready():
+        print("      Baostock 登录失败，本次跳过补录（明天自动再试）")
+        return neg, failed
+
+    print(f"[4/4] Baostock 等比补录：{len(queue)} 只（预算 {budget}，单连接串行）...")
+    brk = Breaker("Baostock(补录)", threshold=8, probe_every=40)
+    first_err, got, t0 = True, 0, time.time()
+    for i, code in enumerate(queue):
+        if brk.should_try():
+            try:
+                low = bs_hist_low(code)
+                brk.ok()
+                if low is not None and low > 0:
+                    name = stocks_map.get(code) or items.get(code, {}).get("n", "")
+                    items[code] = make_record(code, name, low, "bs", ipo_map)
+                    got += 1
+            except Exception as e:
+                if first_err:
+                    print(f"      Baostock 首个失败样本：{type(e).__name__}: {e}")
+                    first_err = False
+                brk.fail()
+        time.sleep(sleep)
+        n = i + 1
+        if n % 200 == 0 or n == len(queue):
+            eta = (len(queue) - n) * (time.time() - t0) / max(n, 1) / 60
+            print(f"      补录 {n}/{len(queue)}  成功 {got}  预计剩余 {eta:.0f} 分钟")
+    stats["bs"] += got
+    print(f"      补录完成：{got} 只拿到等比口径数据")
+    return [c for c in neg if c not in items], [c for c in failed if c not in items]
 
 
 # ---------------------------------------------------------------- 断点缓存
@@ -596,8 +658,7 @@ def shard_worker(shard, codes, done, ipo_map, prev_ok, sleep, cache_dir, result_
     _reset_session()
     writer = ShardWriter(Path(cache_dir), shard)
     stats = {"em": 0, "px": 0, "tx": 0, "bs": 0}
-    brks = {"em": Breaker(f"[w{shard}]东财直连"), "px": Breaker(f"[w{shard}]东财代理"),
-            "bs": Breaker(f"[w{shard}]Baostock")}
+    brks = {"em": Breaker(f"[w{shard}]东财直连"), "px": Breaker(f"[w{shard}]东财代理")}
     items, failed, neg, stale_used = {}, [], [], []
     t0 = time.time()
     for i, (code, name) in enumerate(codes):
@@ -623,6 +684,8 @@ def main() -> None:
     parser.add_argument("--sleep", type=float, default=0.2, help="每只股票之间的间隔秒数")
     parser.add_argument("--workers", type=int, default=4, help="并行进程数（1 = 单进程）")
     parser.add_argument("--cache", default=".cache")
+    parser.add_argument("--bs-budget", type=int, default=1500,
+                        help="Baostock 补录阶段每次最多处理多少只（0 = 跳过补录）")
     parser.add_argument("--min-count", type=int, default=4000)
     args = parser.parse_args()
 
@@ -666,7 +729,7 @@ def main() -> None:
 
     if n_workers == 1:
         writer = ShardWriter(cache_dir, 0)
-        brks = {"em": Breaker("东财直连"), "px": Breaker("东财代理"), "bs": Breaker("Baostock")}
+        brks = {"em": Breaker("东财直连"), "px": Breaker("东财代理")}
         for i, (code, name) in enumerate(stocks):
             process_stock(code, name, done, writer, ipo_map, prev_ok, stats, brks,
                           items, failed, neg, stale_used, args.sleep)
@@ -700,13 +763,16 @@ def main() -> None:
                 stats[k] += r["stats"].get(k, 0)
             rf.unlink()
 
+    # Baostock 等比补录（单连接串行）
+    if args.bs_budget > 0:
+        neg, failed = bs_rescue(items, neg, failed, dict(stocks), ipo_map, stats, args.bs_budget)
+
     # 收尾二次重试（主进程内串行，量小）
     if failed:
         print(f"      对失败的 {len(failed)} 只做二次重试 ...")
         name_map = dict(stocks)
         writer = ShardWriter(cache_dir, 99)
-        brks = {"em": Breaker("东财直连(重试)"), "px": Breaker("东财代理(重试)"),
-                "bs": Breaker("Baostock(重试)")}
+        brks = {"em": Breaker("东财直连(重试)"), "px": Breaker("东财代理(重试)")}
         still = []
         for code in failed:
             low, src = fetch_hist_low(code, stats, brks)
@@ -735,7 +801,7 @@ def main() -> None:
                          "拒绝写出以免部署残缺数据。可到 Actions 页 Re-run 重试。")
 
     payload = {
-        "build_date": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "build_date": dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M"),
         "count": len(items),
         "failed": failed,
         "neg_excluded": neg,

@@ -332,21 +332,20 @@ def _num(rec, keys, default=0.0):
 
 
 def fetch_bonus_events() -> dict:
-    """全市场分红送配事件：{code: [(除权除息日'YYYY-MM-DD', 每股现金红利税前, 每股送转比例), ...]}
-    与首发价格同一个数据中心域名（实测对 GitHub 可达）。"""
-    print("[3/4] 拉取全市场分红送配事件表（东财数据中心）...")
-    base = {"sortColumns": "EX_DIVIDEND_DATE", "sortTypes": "-1",
-            "pageSize": 5000, "pageNumber": 1,
-            "reportName": "RPT_SHAREBONUS_DET",
-            "quoteColumns": "", "source": "WEB", "client": "WEB", "filter": ""}
-    events, rows = {}, 0
+    """全市场分红送配事件：{code: [(除权除息日, 每股现金红利税前, 每股送转比例), ...]}
+    按年代分窗口拉取（每 4 年一窗、各自翻页），绕开单次查询 3 万条的服务端截断，
+    确保 1990 年以来的老分红也完整纳入复权因子。"""
+    print("[3/4] 拉取全市场分红送配事件表（东财数据中心，按年代分窗）...")
+    this_year = dt.date.today().year
+    events, rows, mode = {}, 0, None
 
     def eat(j):
         nonlocal rows
+        got = 0
         for rec in ((j or {}).get("result") or {}).get("data") or []:
             ex = str(rec.get("EX_DIVIDEND_DATE") or "")[:10]
             if len(ex) != 10:
-                continue  # 尚未实施、没有除权除息日的预案，跳过
+                continue
             code = str(rec.get("SECURITY_CODE", "")).zfill(6)
             cash10 = _num(rec, ["PRETAX_BONUS_RMB", "PRETAX_BONUS_AMOUNT"])
             gift10 = _num(rec, ["BONUS_IT_RATIO"])
@@ -356,23 +355,35 @@ def fetch_bonus_events() -> dict:
                 continue
             events.setdefault(code, []).append((ex, cash10 / 10.0, gift10 / 10.0))
             rows += 1
+            got += 1
+        return got
+
+    def fetch_window(y0, y1, columns):
+        params = {"sortColumns": "EX_DIVIDEND_DATE", "sortTypes": "-1",
+                  "pageSize": 5000, "pageNumber": 1,
+                  "reportName": "RPT_SHAREBONUS_DET",
+                  "columns": columns, "quoteColumns": "",
+                  "source": "WEB", "client": "WEB",
+                  "filter": f"(EX_DIVIDEND_DATE>='{y0}-01-01')(EX_DIVIDEND_DATE<'{y1}-01-01')"}
+        first = get_json(EM_DATA, "/api/data/v1/get", params, "https://data.eastmoney.com/", timeout=30)
+        pages = int(((first or {}).get("result") or {}).get("pages") or 0)
+        eat(first)
+        for pn in range(2, min(pages, 20) + 1):
+            params["pageNumber"] = pn
+            eat(get_json(EM_DATA, "/api/data/v1/get", params, "https://data.eastmoney.com/", timeout=30))
+            time.sleep(0.15 + random.random() * 0.2)
 
     for columns in ("SECURITY_CODE,EX_DIVIDEND_DATE,PRETAX_BONUS_RMB,BONUS_IT_RATIO", "ALL"):
         try:
-            params = dict(base, columns=columns)
-            first = get_json(EM_DATA, "/api/data/v1/get", params, "https://data.eastmoney.com/", timeout=30)
-            pages = int(((first or {}).get("result") or {}).get("pages") or 0)
-            eat(first)
-            if not events:
-                raise RuntimeError("首页无有效事件")
-            for pn in range(2, min(pages, 60) + 1):
-                params["pageNumber"] = pn
-                eat(get_json(EM_DATA, "/api/data/v1/get", params, "https://data.eastmoney.com/", timeout=30))
-                time.sleep(0.15 + random.random() * 0.25)
-            print(f"      拿到 {rows} 条事件，覆盖 {len(events)} 只股票")
+            events, rows = {}, 0
+            for y0 in range(1990, this_year + 1, 4):
+                fetch_window(y0, min(y0 + 4, this_year + 2), columns)
+                time.sleep(0.1)
+            if rows < 10000:
+                raise RuntimeError(f"事件总量只有 {rows} 条，疑似异常")
+            print(f"      拿到 {rows} 条事件，覆盖 {len(events)} 只股票（{(this_year - 1990) // 4 + 1} 个年代窗口）")
             return events
         except Exception as e:
-            events, rows = {}, 0
             print(f"      !! 事件表拉取失败（columns={columns[:12]}...）：{e}")
     return {}   # 空 = 自算通道将被禁用（宁缺毋错）
 

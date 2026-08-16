@@ -4,33 +4,32 @@
 每日盘后构建"分母"数据：
     分母 = Min(历史最低价[前复权·等比], 首发价格)
 
-口径说明：
-  前复权有两个流派——减法复权（同花顺/通达信/腾讯，高分红老股会出现负价格）
-  和等比复权（东方财富/Baostock，永远为正）。"最新价÷历史最低"只有在等比口径
-  下才有"距底部多少倍"的含义。历史最低用周K线取 min，与日K线取 min 数学等价
-  （每根周线的 low 就是那一周的最低价），数据量降 5 倍。
+v11 核心思路 —— 不再依赖任何第三方的"复权后数据"，自己算等比复权：
+    等比前复权只需要两样东西：
+      1. 不复权原始日K（腾讯行情，实测对 GitHub 海外 IP 永远可达）
+      2. 分红送配事件表（东财数据中心，与首发价格同一域名，实测同样永远可达）
+    对每个除权除息日，按交易所公式算除权除息参考价：
+        ref = (前收盘 - 每股现金红利) / (1 + 每股送转比例)
+        当日等比因子 r = ref / 前收盘   （恒有 0 < r <= 1，绝不产生负价格）
+    历史某日的前复权价 = 原始价 × ∏(该日之后所有事件的 r)，全序列取最低即得分母。
+    与东财口径一致；已知细微差异：纯配股事件未纳入（三十年仅数百例，影响可忽略）。
 
-数据链路（专为 GitHub Actions 海外 IP 设计）：
-  股票名单：东财直连 → 东财·经 Worker 代理 → 腾讯（沪深京）→ 新浪 → 上一份名单
-  历史K线：东财直连 → 东财·经 Worker 代理 → Baostock（等比，沪深，T+1）
-           → 腾讯（减法口径近似，含非正值则剔除）
-  首发价格：东财数据中心；失败则本次缺失
-  口径优先级：东财新鲜 > 等比滞后顶替(≤10日) > Baostock > 腾讯近似 > 剔除
+数据链路：
+    股票名单：东财直连 → 东财·经 Worker 代理 → 腾讯（沪深京）→ 新浪 → 上一份名单
+    历史K线：东财K线直连(半开探测) → 东财K线·代理 → 自算(腾讯原始价×事件表)
+    首发价格 / 分红送配事件：东财数据中心
+    口径优先级：东财新鲜 > 自算(等比) > 等比滞后顶替(≤15日) > 缺席
 
-性能与稳健：
-  - 多进程分片并行（--workers，默认 4），每个进程独立连接与熔断器
-  - Baostock 断线自动重连、每 250 次查询主动换连接、库刷屏输出静音
-  - 东财半开熔断：熔断后定期探测，抓住间歇性放行的时间窗
-  - 断点续跑（同日重跑跳过已完成）、收尾二次重试、结果过少拒绝写出
+其他：多进程分片（--workers）、半开熔断、断点续跑、收尾二次重试、
+      结果过少拒绝写出、事件表拉取失败则禁用自算通道（宁缺毋错）。
 
 用法：
     python build_denominator.py --limit 80 --out ../worker/public/denominator.json
     python build_denominator.py --out ../worker/public/denominator.json --workers 4
 """
 import argparse
-import contextlib
+import bisect
 import datetime as dt
-import io
 import json
 import math
 import multiprocessing as mp
@@ -43,14 +42,14 @@ from pathlib import Path
 
 import requests
 
-# baostock 的 socket 不带超时，服务器抽风时会永久阻塞——全局兜底
 socket.setdefaulttimeout(25)
 
-# 所有打印强制 flush，进度实时可见（与 PYTHONUNBUFFERED 双保险）
+# 所有打印强制 flush，进度实时可见
 _print = print
 def print(*args, **kwargs):  # noqa: A001
     kwargs.setdefault("flush", True)
     _print(*args, **kwargs)
+
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
@@ -70,7 +69,6 @@ EM_PROXY = (os.environ.get("EM_PROXY") or "").strip().rstrip("/")
 PROBE_EVERY = 25      # 熔断后每隔多少只股票探测一次
 BREAK_AFTER = 5       # 连续失败多少次触发熔断
 STALE_MAX = 15        # 等比口径历史数据最多沿用多少个交易日
-BS_RELOGIN_EVERY = 250
 
 
 # ---------------------------------------------------------------- 请求层
@@ -260,7 +258,7 @@ def list_sina():
 
 
 def fetch_stock_list(prev_json_path: str):
-    print("[1/3] 拉取全市场股票列表 ...")
+    print("[1/4] 拉取全市场股票列表 ...")
     sources = [("东财", list_em)]
     if EM_PROXY:
         sources.append(("东财(代理)", list_em_proxy))
@@ -287,7 +285,7 @@ def fetch_stock_list(prev_json_path: str):
 
 # ---------------------------------------------------------------- 首发价格
 def fetch_ipo_prices() -> dict:
-    print("[2/3] 拉取首发价格（东财新股数据库）...")
+    print("[2/4] 拉取首发价格（东财数据中心）...")
     params = {"sortColumns": "APPLY_DATE,SECURITY_CODE", "sortTypes": "-1,-1",
               "pageSize": 5000, "pageNumber": 1,
               "reportName": "RPTA_APP_IPOAPPLY",
@@ -320,6 +318,65 @@ def fetch_ipo_prices() -> dict:
     return result
 
 
+# ---------------------------------------------------------------- 分红送配事件表（自算复权的原料）
+def _num(rec, keys, default=0.0):
+    for k in keys:
+        v = rec.get(k)
+        if v is None or v == "-":
+            continue
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            continue
+    return default
+
+
+def fetch_bonus_events() -> dict:
+    """全市场分红送配事件：{code: [(除权除息日'YYYY-MM-DD', 每股现金红利税前, 每股送转比例), ...]}
+    与首发价格同一个数据中心域名（实测对 GitHub 可达）。"""
+    print("[3/4] 拉取全市场分红送配事件表（东财数据中心）...")
+    base = {"sortColumns": "EX_DIVIDEND_DATE", "sortTypes": "-1",
+            "pageSize": 5000, "pageNumber": 1,
+            "reportName": "RPT_SHAREBONUS_DET",
+            "quoteColumns": "", "source": "WEB", "client": "WEB", "filter": ""}
+    events, rows = {}, 0
+
+    def eat(j):
+        nonlocal rows
+        for rec in ((j or {}).get("result") or {}).get("data") or []:
+            ex = str(rec.get("EX_DIVIDEND_DATE") or "")[:10]
+            if len(ex) != 10:
+                continue  # 尚未实施、没有除权除息日的预案，跳过
+            code = str(rec.get("SECURITY_CODE", "")).zfill(6)
+            cash10 = _num(rec, ["PRETAX_BONUS_RMB", "PRETAX_BONUS_AMOUNT"])
+            gift10 = _num(rec, ["BONUS_IT_RATIO"])
+            if gift10 == 0.0:
+                gift10 = _num(rec, ["BONUS_RATIO"]) + _num(rec, ["IT_RATIO"])
+            if cash10 <= 0 and gift10 <= 0:
+                continue
+            events.setdefault(code, []).append((ex, cash10 / 10.0, gift10 / 10.0))
+            rows += 1
+
+    for columns in ("SECURITY_CODE,EX_DIVIDEND_DATE,PRETAX_BONUS_RMB,BONUS_IT_RATIO", "ALL"):
+        try:
+            params = dict(base, columns=columns)
+            first = get_json(EM_DATA, "/api/data/v1/get", params, "https://data.eastmoney.com/", timeout=30)
+            pages = int(((first or {}).get("result") or {}).get("pages") or 0)
+            eat(first)
+            if not events:
+                raise RuntimeError("首页无有效事件")
+            for pn in range(2, min(pages, 60) + 1):
+                params["pageNumber"] = pn
+                eat(get_json(EM_DATA, "/api/data/v1/get", params, "https://data.eastmoney.com/", timeout=30))
+                time.sleep(0.15 + random.random() * 0.25)
+            print(f"      拿到 {rows} 条事件，覆盖 {len(events)} 只股票")
+            return events
+        except Exception as e:
+            events, rows = {}, 0
+            print(f"      !! 事件表拉取失败（columns={columns[:12]}...）：{e}")
+    return {}   # 空 = 自算通道将被禁用（宁缺毋错）
+
+
 # ---------------------------------------------------------------- 半开熔断
 class Breaker:
     def __init__(self, name: str, threshold: int = None, probe_every: int = None):
@@ -347,7 +404,7 @@ class Breaker:
             print(f"      !! {self.name} 连续失败，熔断（此后每 {self.probe_every} 只探测一次）")
 
 
-# ---------------------------------------------------------------- 东财 K 线（日线，精确）
+# ---------------------------------------------------------------- 东财 K 线（等比，直连/代理，漏风就赚）
 def _parse_em_kline(j):
     klines = ((j or {}).get("data") or {}).get("klines")
     if not klines:
@@ -373,124 +430,77 @@ def em_hist_low_proxy(code: str):
     return _parse_em_kline(proxy_json("/api/kline", {"secid": em_secid(code)}, tries=2))
 
 
-# ---------------------------------------------------------------- Baostock（周线等比，断线自愈）
-_BS = {"ok": None, "uses": 0, "denied": 0}
-BS_LOGIN_RETRY_EVERY = 200
-
-
-def _bs_quiet(fn, *args, **kwargs):
-    with contextlib.redirect_stdout(io.StringIO()):
-        return fn(*args, **kwargs)
-
-
-def _bs_login() -> bool:
-    try:
-        import baostock as bs
-        try:
-            _bs_quiet(bs.logout)
-        except Exception:
-            pass
-        lg = _bs_quiet(bs.login)
-        _BS["uses"] = 0
-        return getattr(lg, "error_code", "1") == "0"
-    except Exception:
-        return False
-
-
-def _bs_ready() -> bool:
-    if _BS["ok"] is None:
-        _BS["ok"] = _bs_login()
-        if not _BS["ok"]:
-            print("      !! Baostock 暂不可用（登录失败/超时），稍后自动重试")
-    elif _BS["ok"] is False:
-        _BS["denied"] += 1
-        if _BS["denied"] % BS_LOGIN_RETRY_EVERY == 0:
-            _BS["ok"] = _bs_login()
-            if _BS["ok"]:
-                print("      >> Baostock 重新登录成功，通道恢复")
-    return bool(_BS["ok"])
-
-
-_BS_MODE = {"f": "w", "wfail": 0}   # 周线口径持续失败会自动切回日线
-
-
-def _bs_query_low(code: str, freq: str = None):
-    import baostock as bs
-    sym = ("sh." if code.startswith("6") else "sz.") + code
-    # 周K取 min 与日K取 min 等价（每根周线的 low 就是当周最低），数据量降 5 倍
-    rs = _bs_quiet(bs.query_history_k_data_plus, sym, "low",
-                   start_date="1990-01-01", frequency=freq or _BS_MODE["f"], adjustflag="2")
-    if getattr(rs, "error_code", "1") != "0":
-        raise RuntimeError(f"baostock error_code={rs.error_code}")
-    lows = []
-    with contextlib.redirect_stdout(io.StringIO()):
-        while rs.next():
-            row = rs.get_row_data()
-            try:
-                lows.append(float(row[0]))
-            except (ValueError, TypeError, IndexError):
-                continue
-    if not lows:
-        raise RuntimeError("baostock 返回空序列")
-    return _min_positive(lows)
-
-
-def bs_hist_low(code: str):
-    _BS["uses"] += 1
-    if _BS["uses"] >= BS_RELOGIN_EVERY:
-        _bs_login()
-    try:
-        v = _bs_query_low(code)
-        _BS_MODE["wfail"] = 0
-        return v
-    except Exception:
-        if not _bs_login():
-            raise
-        try:
-            v = _bs_query_low(code)
-            _BS_MODE["wfail"] = 0
-            return v
-        except Exception:
-            if _BS_MODE["f"] == "w":
-                _BS_MODE["wfail"] += 1
-                if _BS_MODE["wfail"] >= 3:
-                    _BS_MODE["f"] = "d"
-                    print("      !! Baostock 周线口径持续失败，自动切换回日线")
-                return _bs_query_low(code, "d")   # 立刻用日线再试一次
-            raise
-
-
-# ---------------------------------------------------------------- 腾讯（周线，减法口径近似）
-def tx_hist_low(code: str):
-    """返回 (正值最低, 是否含非正值)。含非正值 = 减法复权失真，不可用。"""
+# ---------------------------------------------------------------- 自算等比复权（腾讯原始价 × 事件表）
+def tx_raw_daily(code: str):
+    """腾讯不复权日K全历史，返回升序 [(date, low, close), ...]。"""
     sym = tx_symbol(code)
-    lows, dirty, end = [], False, ""
-    for _ in range(12):
+    bars, end = [], ""
+    for _ in range(30):   # 30 × 640 根，覆盖任何 A 股历史
         j = get_json(TX_IFZQ, "/appstock/app/fqkline/get",
-                     {"param": f"{sym},week,,{end},640,qfq"}, "https://gu.qq.com/")
+                     {"param": f"{sym},day,,{end},640,"}, "https://gu.qq.com/")
         node = ((j or {}).get("data") or {}).get(sym) or {}
-        arr = node.get("qfqweek") or node.get("week") or []
+        arr = node.get("day") or []
         if not arr:
             break
-        for bar in arr:
+        chunk = []
+        for b in arr:
             try:
-                v = float(bar[4])
+                chunk.append((str(b[0])[:10], float(b[4]), float(b[2])))
             except (ValueError, TypeError, IndexError):
                 continue
-            if v <= 0:
-                dirty = True
-            else:
-                lows.append(v)
+        bars = chunk + bars
         if len(arr) < 640:
             break
-        first_day = dt.date.fromisoformat(arr[0][0])
+        first_day = dt.date.fromisoformat(str(arr[0][0])[:10])
         end = (first_day - dt.timedelta(days=1)).isoformat()
-        time.sleep(0.1)
-    return (_min_positive(lows), dirty)
+        time.sleep(0.08)
+    return bars
 
 
-def fetch_hist_low(code: str, stats: dict, brks: dict):
-    """返回 (low, src)。src: em/px/bs/tx；减法复权失真 (None,'neg')；全失败 (None,None)。"""
+def compute_qfq_low(bars, stock_events):
+    """等比前复权历史最低：
+    对每个除权除息日算 r = (前收盘 - 每股现金) / (前收盘 × (1 + 每股送转))，
+    历史价 × 之后所有 r 的连乘，全序列取正值最低。r ∈ (0,1]，绝无负价格。"""
+    if not bars:
+        return None
+    dates = [b[0] for b in bars]
+    last_date = dates[-1]
+    ratios = []
+    for ex, cash, gift in sorted(stock_events or []):
+        if ex > last_date:
+            continue   # 未来/未生效的事件不影响当前锚定
+        i = bisect.bisect_left(dates, ex) - 1   # 除权除息日前最后一个交易日
+        if i < 0:
+            continue
+        pc = bars[i][2]
+        if pc <= 0:
+            continue
+        ref = (pc - cash) / (1.0 + gift)
+        if ref <= 0:
+            continue
+        ratios.append((ex, ref / pc))
+    F, j, best = 1.0, len(ratios) - 1, None
+    for k in range(len(bars) - 1, -1, -1):
+        d, low, _close = bars[k]
+        while j >= 0 and ratios[j][0] > d:
+            F *= ratios[j][1]
+            j -= 1
+        if low > 0:
+            v = low * F
+            if best is None or v < best:
+                best = v
+    return round(best, 4) if best is not None else None
+
+
+def computed_hist_low(code: str, events: dict):
+    bars = tx_raw_daily(code)
+    if not bars:
+        return None
+    return compute_qfq_low(bars, events.get(code))
+
+
+def fetch_hist_low(code: str, stats: dict, brks: dict, events, events_ok: bool):
+    """返回 (low, src)。src: em/px/c；全失败 (None, None)。"""
     if brks["em"].should_try():
         try:
             v = em_hist_low(code)
@@ -509,76 +519,19 @@ def fetch_hist_low(code: str, stats: dict, brks: dict):
                 return v, "px"
         except Exception:
             brks["px"].fail()
-    try:
-        v, dirty = tx_hist_low(code)
-        if dirty:
-            return None, "neg"
-        if v is not None:
-            stats["tx"] += 1
-            return v, "tx"
-    except Exception:
-        pass
+    if events_ok:
+        try:
+            v = computed_hist_low(code, events)
+            if v is not None:
+                stats["c"] += 1
+                return v, "c"
+        except Exception:
+            pass
     return None, None
-
-
-# ---------------------------------------------------------------- Baostock 等比补录（单连接串行）
-def bs_rescue(items, neg, failed, stocks_map, ipo_map, stats, budget, sleep=0.15):
-    """并行阶段结束后，由主进程用单条 Baostock 连接串行补等比数据（多进程多连接
-    会被服务端互踢会话，这是此前 Baostock 全灭的根因）。
-    优先级：被剔除/失败的（否则缺席）> 腾讯近似的（升级口径）> 最旧的滞后记录（轮换刷新）。
-    每天预算 budget 只，全市场会在几天内收敛为等比口径并持续轮换保鲜。"""
-    queue, seen = [], set()
-
-    def add(c):
-        if c not in seen and not c.startswith(("43", "83", "87", "88", "92")):
-            seen.add(c)
-            queue.append(c)
-
-    for c in neg + failed:
-        add(c)
-    for c, rec in items.items():
-        if rec.get("s") == "tx":
-            add(c)
-    for c in sorted((c for c, r in items.items() if r.get("st")),
-                    key=lambda c: -int(items[c].get("st", 0))):
-        add(c)
-    queue = queue[:budget]
-    if not queue:
-        return neg, failed
-    if not _bs_ready():
-        print("      Baostock 登录失败，本次跳过补录（明天自动再试）")
-        return neg, failed
-
-    print(f"[4/4] Baostock 等比补录：{len(queue)} 只（预算 {budget}，单连接串行）...")
-    brk = Breaker("Baostock(补录)", threshold=8, probe_every=40)
-    first_err, got, t0 = True, 0, time.time()
-    for i, code in enumerate(queue):
-        if brk.should_try():
-            try:
-                low = bs_hist_low(code)
-                brk.ok()
-                if low is not None and low > 0:
-                    name = stocks_map.get(code) or items.get(code, {}).get("n", "")
-                    items[code] = make_record(code, name, low, "bs", ipo_map)
-                    got += 1
-            except Exception as e:
-                if first_err:
-                    print(f"      Baostock 首个失败样本：{type(e).__name__}: {e}")
-                    first_err = False
-                brk.fail()
-        time.sleep(sleep)
-        n = i + 1
-        if n % 200 == 0 or n == len(queue):
-            eta = (len(queue) - n) * (time.time() - t0) / max(n, 1) / 60
-            print(f"      补录 {n}/{len(queue)}  成功 {got}  预计剩余 {eta:.0f} 分钟")
-    stats["bs"] += got
-    print(f"      补录完成：{got} 只拿到等比口径数据")
-    return [c for c in neg if c not in items], [c for c in failed if c not in items]
 
 
 # ---------------------------------------------------------------- 断点缓存
 def load_done(cache_dir: Path) -> dict:
-    """加载今天所有分片的断点缓存（含单进程模式的）。"""
     today = dt.date.today().strftime("%Y%m%d")
     done = {}
     for p in cache_dir.glob(f"lows-{today}*.jsonl"):
@@ -606,10 +559,8 @@ class ShardWriter:
 def make_record(code, name, low, src, ipo_map):
     ipo = ipo_map.get(code)
     den = min(low, ipo) if ipo else low
-    rec = {"n": name, "b": board_of(code), "l": low, "i": ipo, "d": round(den, 4)}
-    if src in ("tx", "bs"):
-        rec["s"] = src
-    return rec
+    # em/px/c 都是等比口径，一视同仁，不打标（历史遗留的 bs 标记仍可被顶替沿用）
+    return {"n": name, "b": board_of(code), "l": low, "i": ipo, "d": round(den, 4)}
 
 
 def carry_from_prev(prev_ok, code, name):
@@ -626,52 +577,47 @@ def carry_from_prev(prev_ok, code, name):
 
 
 def process_stock(code, name, done, writer, ipo_map, prev_ok, stats, brks,
-                  items, failed, neg, stale_used, sleep):
+                  items, failed, stale_used, sleep, events, events_ok):
     if code in done:
         low, src = done[code]
     else:
-        low, src = fetch_hist_low(code, stats, brks)
-        if low is not None and src in ("em", "px", "bs", "tx"):
+        low, src = fetch_hist_low(code, stats, brks, events, events_ok)
+        if low is not None and src in ("em", "px", "c"):
             writer.save(code, low, src)
         time.sleep(sleep)
 
-    if src in ("em", "px") and low is not None and low > 0:
+    if low is not None and low > 0 and src in ("em", "px", "c"):
         items[code] = make_record(code, name, low, src, ipo_map)
         return
-    carried = carry_from_prev(prev_ok, code, name)   # 等比滞后数据优先于腾讯近似
-    if src == "bs" and low is not None and low > 0:
-        items[code] = make_record(code, name, low, src, ipo_map)
-    elif carried is not None:
+    carried = carry_from_prev(prev_ok, code, name)
+    if carried is not None:
         items[code] = carried
         stale_used.append(code)
-    elif src == "tx" and low is not None and low > 0:
-        items[code] = make_record(code, name, low, src, ipo_map)
-    elif src == "neg":
-        neg.append(code)
     else:
         failed.append(code)
 
 
-def shard_worker(shard, codes, done, ipo_map, prev_ok, sleep, cache_dir, result_file):
-    time.sleep(shard * 2.0)   # 错峰启动，避免多进程同时轰击
+def shard_worker(shard, codes, done, ipo_map, prev_ok, sleep, cache_dir, result_file,
+                 events, events_ok):
+    time.sleep(shard * 1.5)
     socket.setdefaulttimeout(25)
     _reset_session()
     writer = ShardWriter(Path(cache_dir), shard)
-    stats = {"em": 0, "px": 0, "tx": 0, "bs": 0}
+    stats = {"em": 0, "px": 0, "c": 0}
     brks = {"em": Breaker(f"[w{shard}]东财直连"), "px": Breaker(f"[w{shard}]东财代理")}
-    items, failed, neg, stale_used = {}, [], [], []
+    items, failed, stale_used = {}, [], []
     t0 = time.time()
     for i, (code, name) in enumerate(codes):
         process_stock(code, name, done, writer, ipo_map, prev_ok, stats, brks,
-                      items, failed, neg, stale_used, sleep)
+                      items, failed, stale_used, sleep, events, events_ok)
         n = i + 1
         if n % 100 == 0 or n == len(codes):
             speed = n / max(time.time() - t0, 1)
             eta = (len(codes) - n) / max(speed, 0.01)
             print(f"      [w{shard}] {n}/{len(codes)}  成功 {len(items)}  失败 {len(failed)}  "
-                  f"剔除 {len(neg)}  预计剩余 {eta/60:.0f} 分钟")
+                  f"预计剩余 {eta/60:.0f} 分钟")
     Path(result_file).write_text(json.dumps(
-        {"items": items, "failed": failed, "neg": neg, "stale_used": stale_used, "stats": stats},
+        {"items": items, "failed": failed, "stale_used": stale_used, "stats": stats},
         ensure_ascii=False), encoding="utf-8")
 
 
@@ -681,11 +627,9 @@ def main() -> None:
     parser.add_argument("--out", default="../worker/public/denominator.json")
     parser.add_argument("--limit", type=int, default=0, help="只处理前 N 只（试跑），0 = 全量")
     parser.add_argument("--codes", default="", help="只处理指定代码，逗号分隔")
-    parser.add_argument("--sleep", type=float, default=0.2, help="每只股票之间的间隔秒数")
+    parser.add_argument("--sleep", type=float, default=0.15, help="每只股票之间的间隔秒数")
     parser.add_argument("--workers", type=int, default=4, help="并行进程数（1 = 单进程）")
     parser.add_argument("--cache", default=".cache")
-    parser.add_argument("--bs-budget", type=int, default=1500,
-                        help="Baostock 补录阶段每次最多处理多少只（0 = 跳过补录）")
     parser.add_argument("--min-count", type=int, default=4000)
     args = parser.parse_args()
 
@@ -701,13 +645,17 @@ def main() -> None:
         stocks = stocks[: args.limit]
 
     ipo_map = fetch_ipo_prices()
+    events = fetch_bonus_events()
+    events_ok = bool(events)
+    if not events_ok:
+        print("      !! 事件表不可用，本次禁用自算通道（依赖东财漏风 + 滞后顶替，宁缺毋错）")
 
     prev_ok = {}
     try:
         prev = json.loads(Path(args.out).read_text(encoding="utf-8"))
         if not prev.get("sample"):
             for c, rec in (prev.get("items") or {}).items():
-                if rec.get("s") in (None, "bs"):   # 东财或 Baostock = 等比口径，可顶替
+                if rec.get("s") in (None, "bs"):   # 等比口径（东财/自算/历史bs）可顶替
                     prev_ok[c] = rec
     except Exception:
         pass
@@ -721,24 +669,24 @@ def main() -> None:
         print(f"      发现断点缓存：已完成 {len(done)} 只")
 
     n_workers = max(1, min(args.workers, 8))
-    print(f"[3/3] 拉取前复权历史最低价，共 {len(stocks)} 只，{n_workers} 进程并行 ...")
+    print(f"[4/4] 计算前复权历史最低价，共 {len(stocks)} 只，{n_workers} 进程并行 ...")
     t0 = time.time()
 
-    items, failed, neg, stale_used = {}, [], [], []
-    stats = {"em": 0, "px": 0, "tx": 0, "bs": 0}
+    items, failed, stale_used = {}, [], []
+    stats = {"em": 0, "px": 0, "c": 0}
 
     if n_workers == 1:
         writer = ShardWriter(cache_dir, 0)
         brks = {"em": Breaker("东财直连"), "px": Breaker("东财代理")}
         for i, (code, name) in enumerate(stocks):
             process_stock(code, name, done, writer, ipo_map, prev_ok, stats, brks,
-                          items, failed, neg, stale_used, args.sleep)
+                          items, failed, stale_used, args.sleep, events, events_ok)
             n = i + 1
             if n % 100 == 0 or n == len(stocks):
                 speed = n / max(time.time() - t0, 1)
                 eta = (len(stocks) - n) / max(speed, 0.01)
                 print(f"      {n}/{len(stocks)}  成功 {len(items)}  失败 {len(failed)}  "
-                      f"剔除 {len(neg)}  预计剩余 {eta/60:.0f} 分钟")
+                      f"预计剩余 {eta/60:.0f} 分钟")
     else:
         shards = [stocks[i::n_workers] for i in range(n_workers)]
         result_files = [cache_dir / f"result-w{i}.json" for i in range(n_workers)]
@@ -746,7 +694,7 @@ def main() -> None:
         for i in range(n_workers):
             p = mp.Process(target=shard_worker,
                            args=(i, shards[i], done, ipo_map, prev_ok, args.sleep,
-                                 str(cache_dir), str(result_files[i])))
+                                 str(cache_dir), str(result_files[i]), events, events_ok))
             p.start()
             procs.append(p)
         for p in procs:
@@ -757,17 +705,12 @@ def main() -> None:
             r = json.loads(rf.read_text(encoding="utf-8"))
             items.update(r["items"])
             failed += r["failed"]
-            neg += r["neg"]
             stale_used += r["stale_used"]
             for k in stats:
                 stats[k] += r["stats"].get(k, 0)
             rf.unlink()
 
-    # Baostock 等比补录（单连接串行）
-    if args.bs_budget > 0:
-        neg, failed = bs_rescue(items, neg, failed, dict(stocks), ipo_map, stats, args.bs_budget)
-
-    # 收尾二次重试（主进程内串行，量小）
+    # 收尾二次重试
     if failed:
         print(f"      对失败的 {len(failed)} 只做二次重试 ...")
         name_map = dict(stocks)
@@ -775,25 +718,13 @@ def main() -> None:
         brks = {"em": Breaker("东财直连(重试)"), "px": Breaker("东财代理(重试)")}
         still = []
         for code in failed:
-            low, src = fetch_hist_low(code, stats, brks)
+            low, src = fetch_hist_low(code, stats, brks, events, events_ok)
             time.sleep(args.sleep)
-            if src == "neg":
-                carried = carry_from_prev(prev_ok, code, name_map.get(code, ""))
-                if carried is not None:
-                    items[code] = carried
-                    stale_used.append(code)
-                else:
-                    neg.append(code)
-            elif low is not None and low > 0:
+            if low is not None and low > 0 and src in ("em", "px", "c"):
                 writer.save(code, low, src)
                 items[code] = make_record(code, name_map.get(code, ""), low, src, ipo_map)
             else:
-                carried = carry_from_prev(prev_ok, code, name_map.get(code, ""))
-                if carried is not None:
-                    items[code] = carried
-                    stale_used.append(code)
-                else:
-                    still.append(code)
+                still.append(code)
         failed = still
 
     if full_run and len(items) < args.min_count:
@@ -804,7 +735,7 @@ def main() -> None:
         "build_date": dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M"),
         "count": len(items),
         "failed": failed,
-        "neg_excluded": neg,
+        "neg_excluded": [],
         "items": items,
     }
     out_path = Path(args.out).resolve()
@@ -814,13 +745,10 @@ def main() -> None:
     mins = (time.time() - t0) / 60
     print(f"\n完成：{len(items)} 只写入 {out_path}（K线阶段耗时 {mins:.0f} 分钟）")
     print(f"股票名单来源：{list_src}；K 线来源：东财直连 {stats['em']}，东财代理 {stats['px']}，"
-          f"Baostock {stats['bs']}，腾讯 {stats['tx']}")
+          f"自算等比(腾讯原始价×事件表) {stats['c']}")
     if stale_used:
         st_max = max(int(items[c].get("st", 0)) for c in stale_used if c in items)
         print(f"用等比口径历史数据顶替 {len(stale_used)} 只（最长滞后 {st_max} 个交易日）")
-    if neg:
-        print(f"减法复权失真剔除 {len(neg)} 只（高分红老股，暂无等比数据可用）: "
-              f"{neg[:15]}{' ...' if len(neg) > 15 else ''}")
     print(f"失败 {len(failed)} 只（停牌新股/退市/接口异常，前端会自动忽略）: "
           f"{failed[:20]}{' ...' if len(failed) > 20 else ''}")
 

@@ -1,2 +1,1 @@
 requests>=2.31
-baostock>=0.8

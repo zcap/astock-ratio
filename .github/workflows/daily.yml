@@ -45,7 +45,7 @@ jobs:
 
       - name: Build denominator.json
         working-directory: builder
-        run: python build_denominator.py --out ../worker/public/denominator.json --workers 4 --limit ${{ github.event.inputs.limit || '0' }}
+        run: python build_denominator.py --out ../worker/public/denominator.json --workers 6 --limit ${{ github.event.inputs.limit || '0' }}
 
       - name: Commit data back to repo    # 试跑(limit>0)不提交，避免小样本数据污染仓库
         if: ${{ (github.event.inputs.limit || '0') == '0' }}
